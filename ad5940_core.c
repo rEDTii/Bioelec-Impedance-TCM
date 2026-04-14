@@ -117,12 +117,52 @@ int ad5940_spi_read(struct ad5940_priv *priv, u16 reg)
 		return ret;
 
 	if (reg >= 0x1000 && reg <= 0x3014)
-		return (rx[2] << 24) | (rx[3] << 16) |
-		       (rx[4] << 8)  | rx[5];
+		return (int)((rx[2] << 24) | (rx[3] << 16) |
+		       (rx[4] << 8)  | rx[5]);
 	else
-		return (rx[2] << 8) | rx[3];
+		return (int)((rx[2] << 8) | rx[3]);
 }
 EXPORT_SYMBOL_GPL(ad5940_spi_read);
+
+/**
+ * ad5940_fifo_read - Read one or more words from the data FIFO
+ * @priv: driver private data
+ * @buf: output buffer (must have room for @count u32 words)
+ * @count: number of FIFO words to read
+ *
+ * Uses ADI's recommended "small readcount" method: set address to
+ * REG_AFE_DATAFIFORD once, then issue repeated READREG commands.
+ * Each read automatically pops the next word from the FIFO.
+ *
+ * Return: 0 on success, negative errno on failure
+ */
+int ad5940_fifo_read(struct ad5940_priv *priv, u32 *buf, int count)
+{
+	u8 tx[6], rx[6];
+	int ret, i;
+
+	/* Phase 1: set address to FIFO data register */
+	tx[0] = AD5940_SPI_CMD_SETADDR;
+	tx[1] = (AD5940_REG_FIFODATA >> 8) & 0xff;
+	tx[2] = AD5940_REG_FIFODATA & 0xff;
+	ret = ad5940_spi_xfer(priv, tx, rx, 3);
+	if (ret)
+		return ret;
+
+	/* Phase 2: read 'count' words from FIFO (32-bit register) */
+	for (i = 0; i < count; i++) {
+		memset(tx, 0, 6);
+		tx[0] = AD5940_SPI_CMD_READREG;
+		ret = ad5940_spi_xfer(priv, tx, rx, 6);
+		if (ret)
+			return ret;
+		buf[i] = (rx[2] << 24) | (rx[3] << 16) |
+			  (rx[4] << 8)  | rx[5];
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ad5940_fifo_read);
 
 /* ------------------------------------------------------------------ */
 /*  Hardware reset & wake-up                                          */

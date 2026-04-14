@@ -1,0 +1,7 @@
+0x00000000	ad5940_init	/home/alientek/MyDrivers/ad5940_driver/ad5940	EXPORT_SYMBOL_GPL
+0x00000000	ad5940_spi_read	/home/alientek/MyDrivers/ad5940_driver/ad5940	EXPORT_SYMBOL_GPL
+0x00000000	ad5940_reset	/home/alientek/MyDrivers/ad5940_driver/ad5940	EXPORT_SYMBOL_GPL
+0x00000000	ad5940_fifo_read	/home/alientek/MyDrivers/ad5940_driver/ad5940	EXPORT_SYMBOL_GPL
+0x00000000	ad5940_spi_xfer	/home/alientek/MyDrivers/ad5940_driver/ad5940	EXPORT_SYMBOL_GPL
+0x00000000	ad5940_spi_write	/home/alientek/MyDrivers/ad5940_driver/ad5940	EXPORT_SYMBOL_GPL
+0x00000000	ad5940_wakeup	/home/alientek/MyDrivers/ad5940_driver/ad5940	EXPORT_SYMBOL_GPL

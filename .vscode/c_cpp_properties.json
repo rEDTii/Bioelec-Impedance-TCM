@@ -4,15 +4,27 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/home/alientek/rk3568/SDK/linux/rk3568_linux_sdk/kernel/arch/arm64/include",
                 "/home/alientek/rk3568/SDK/linux/rk3568_linux_sdk/kernel/include",
-                "/home/alientek/rk3568/SDK/linux/rk3568_linux_sdk/kernel/arch/arm64/include/generated"
+                "/home/alientek/rk3568/SDK/linux/rk3568_linux_sdk/kernel/include/generated",
+                "/home/alientek/rk3568/SDK/linux/rk3568_linux_sdk/kernel/include/generated/uapi",
+                "/home/alientek/rk3568/SDK/linux/rk3568_linux_sdk/kernel/include/uapi",
+                "/home/alientek/rk3568/SDK/linux/rk3568_linux_sdk/kernel/arch/arm64/include",
+                "/home/alientek/rk3568/SDK/linux/rk3568_linux_sdk/kernel/arch/arm64/include/generated",
+                "/home/alientek/rk3568/SDK/linux/rk3568_linux_sdk/kernel/arch/arm64/include/generated/uapi",
+                "/home/alientek/rk3568/SDK/linux/rk3568_linux_sdk/kernel/arch/arm64/include/uapi"
             ],
-            "defines": [],
+            "defines": [
+                "__KERNEL__",
+                "MODULE",
+                "__GNUC__",
+                "__aarch64__"
+            ],
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "gnu11",
             "cppStandard": "gnu++14",
-            "intelliSenseMode": "gcc-x64"
+            "intelliSenseMode": "gcc-arm64",
+            "forcedInclude": [],
+            "compilerArgs": []
         }
     ],
     "version": 4
