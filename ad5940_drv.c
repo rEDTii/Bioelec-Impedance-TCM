@@ -162,18 +162,23 @@ static const struct iio_chan_spec ad5940_dft_channels[] = {
 static int ad5940_trigger_set_state(struct iio_trigger *trig, bool state)
 {
 	struct ad5940_priv *priv = iio_trigger_get_drvdata(trig);
-	int ret;
+	int ret = 0;
 
 	if (state) {
 		/*
 		 * TODO: Enable FIFO threshold interrupt in AD5940
 		 * interrupt controller.  Placeholder: enable AFE.
 		 */
-		ret = ad5940_spi_write(priv, AD5940_REG_AFECON,
-				       AD5940_AFECON_FIFOEN);
+		dev_info(&priv->spi->dev, "ad5940_trigger_set_state 1\n");
+
+		// ret = ad5940_spi_write(priv, AD5940_REG_AFECON,
+		// 		       AD5940_AFECON_FIFOEN);
 	} else {
 		/* TODO: Disable FIFO threshold interrupt */
-		ret = ad5940_spi_write(priv, AD5940_REG_AFECON, 0);
+
+		dev_info(&priv->spi->dev, "ad5940_trigger_set_state 0\n");
+
+		// ret = ad5940_spi_write(priv, AD5940_REG_AFECON, 0);
 	}
 
 	return ret;
@@ -182,6 +187,8 @@ static int ad5940_trigger_set_state(struct iio_trigger *trig, bool state)
 static int ad5940_trigger_reenable(struct iio_trigger *trig)
 {
 	struct ad5940_priv *priv = iio_trigger_get_drvdata(trig);
+
+	dev_info(&priv->spi->dev, "ad5940_trigger_reenable\n");
 
 	enable_irq(priv->irq);
 	return 0;
@@ -220,46 +227,49 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	struct iio_poll_func *pf = p;
 	struct iio_dev *indio_dev = pf->indio_dev;
 	struct ad5940_priv *priv = iio_priv(indio_dev);
-	/*
-	 * Buffer layout for iio_push_to_buffers_with_timestamp():
-	 *   4 × u32 channel data  +  1 × s64 timestamp
-	 * The timestamp is appended after channel data by the framework,
-	 * so we must reserve space for it to avoid stack overflow.
-	 */
-	u32 buf[AD5940_DFT_CHANNELS + sizeof(s64) / sizeof(u32)];
-	int ret, fifo_cnt;
 
-	memset(buf, 0, sizeof(buf));
+	dev_info(&priv->spi->dev, "ad5940_trigger_handler\n");
 
-	ret = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
-	if (ret < 0) {
-		dev_err(&priv->spi->dev, "FIFO count read failed: %d\n",
-			ret);
-		goto out;
-	}
-	/* FIFOCNTSTA.DATAFIFOCNTSTA is in bits[26:16], per AD5940 datasheet */
-	fifo_cnt = ret >> 16;
+	// /*
+	//  * Buffer layout for iio_push_to_buffers_with_timestamp():
+	//  *   4 × u32 channel data  +  1 × s64 timestamp
+	//  * The timestamp is appended after channel data by the framework,
+	//  * so we must reserve space for it to avoid stack overflow.
+	//  */
+	// u32 buf[AD5940_DFT_CHANNELS + sizeof(s64) / sizeof(u32)];
+	// int ret, fifo_cnt;
 
-	/*
-	 * TODO: Handle fifo_cnt > 4 (multiple measurement cycles in FIFO).
-	 * For now, read exactly one DFT frame (4 words).
-	 *
-	 * Use ad5940_fifo_read() which sets the FIFO address once then
-	 * reads words sequentially — matching ADI's recommended method
-	 * for small read counts (< 3 words per CS toggle).
-	 * It returns 0 on success (data via output param), avoiding the
-	 * ambiguity of ad5940_spi_read() where 32-bit FIFO data with
-	 * bit31 set would be indistinguishable from a negative errno.
-	 */
-	ret = ad5940_fifo_read(priv, buf, AD5940_DFT_CHANNELS);
-	if (ret) {
-		dev_err(&priv->spi->dev, "FIFO read failed: %d\n", ret);
-		goto out;
-	}
+	// memset(buf, 0, sizeof(buf));
 
-	iio_push_to_buffers_with_timestamp(indio_dev, buf,
-					   iio_get_time_ns(indio_dev));
-out:
+	// ret = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
+	// if (ret < 0) {
+	// 	dev_err(&priv->spi->dev, "FIFO count read failed: %d\n",
+	// 		ret);
+	// 	goto out;
+	// }
+	// /* FIFOCNTSTA.DATAFIFOCNTSTA is in bits[26:16], per AD5940 datasheet */
+	// fifo_cnt = ret >> 16;
+
+	// /*
+	//  * TODO: Handle fifo_cnt > 4 (multiple measurement cycles in FIFO).
+	//  * For now, read exactly one DFT frame (4 words).
+	//  *
+	//  * Use ad5940_fifo_read() which sets the FIFO address once then
+	//  * reads words sequentially — matching ADI's recommended method
+	//  * for small read counts (< 3 words per CS toggle).
+	//  * It returns 0 on success (data via output param), avoiding the
+	//  * ambiguity of ad5940_spi_read() where 32-bit FIFO data with
+	//  * bit31 set would be indistinguishable from a negative errno.
+	//  */
+	// ret = ad5940_fifo_read(priv, buf, AD5940_DFT_CHANNELS);
+	// if (ret) {
+	// 	dev_err(&priv->spi->dev, "FIFO read failed: %d\n", ret);
+	// 	goto out;
+	// }
+
+	// iio_push_to_buffers_with_timestamp(indio_dev, buf,
+	// 				   iio_get_time_ns(indio_dev));
+// out:
 	iio_trigger_notify_done(indio_dev->trig);
 	return IRQ_HANDLED;
 }
@@ -283,6 +293,8 @@ static irqreturn_t ad5940_irq_handler(int irq, void *dev_id)
 {
 	struct iio_dev *indio_dev = dev_id;
 	struct ad5940_priv *priv = iio_priv(indio_dev);
+
+	dev_info(&priv->spi->dev, "ad5940_irq_handler\n");
 
 	/*
 	 * Disable IRQ to prevent re-entry until the trigger handler
@@ -313,6 +325,9 @@ static int ad5940_setup_trigger(struct iio_dev *indio_dev)
 	priv->trig = devm_iio_trigger_alloc(dev, "%s-dev%d",
 					     indio_dev->name,
 					     indio_dev->id);
+
+	dev_info(dev, "iio trig name: %s-dev%d\n", indio_dev->name, indio_dev->id);
+
 	if (!priv->trig)
 		return -ENOMEM;
 
@@ -326,7 +341,24 @@ static int ad5940_setup_trigger(struct iio_dev *indio_dev)
 		return ret;
 	}
 
-	indio_dev->trig = iio_trigger_get(priv->trig);
+	/*
+	 * Associate our trigger as the default for this IIO device.
+	 *
+	 * We MUST NOT use iio_trigger_get() here because it calls
+	 * __module_get(THIS_MODULE), creating a self-reference that
+	 * makes the module refcount permanently > 0 and prevents
+	 * rmmod from ever succeeding.  Instead, we assign directly
+	 * and only take a device reference (get_device) to keep the
+	 * trigger's struct device alive — matching the put_device()
+	 * in ad5940_remove().
+	 *
+	 * Setting indio_dev->trig = NULL in remove() prevents
+	 * iio_device_unregister_trigger_consumer() from calling
+	 * iio_trigger_put(), which would otherwise do an unpaired
+	 * module_put().
+	 */
+	indio_dev->trig = priv->trig;
+	get_device(&priv->trig->dev);
 
 	return 0;
 }
@@ -475,9 +507,23 @@ static int ad5940_remove(struct spi_device *spi)
 	struct iio_dev *indio_dev = spi_get_drvdata(spi);
 	struct ad5940_priv *priv = iio_priv(indio_dev);
 
+	/*
+	 * Clear the trigger association before devm cleanup runs.
+	 * This prevents iio_device_unregister_trigger_consumer()
+	 * (called from iio_dev_release) from calling iio_trigger_put(),
+	 * which would do an unpaired module_put() since we never called
+	 * iio_trigger_get() in setup — we only did get_device().
+	 */
+	if (indio_dev->trig) {
+		put_device(&indio_dev->trig->dev);
+		indio_dev->trig = NULL;
+	}
+
 	/* Assert reset (active) to put AD5940 in low-power state */
 	gpiod_set_value(priv->reset_gpio, 1);
 
+	dev_info(&spi->dev, "ad5940_driver removed.\n");
+	
 	return 0;
 }
 
