@@ -1,0 +1,352 @@
+/*
+ * AD5940 BIA User-Space Demo — Read DFT data via IIO and compute impedance
+ *
+ * Built against libiio v1.0 API (stream model).
+ *
+ * Cross-compile for RK3568 (aarch64):
+ *   TOOLCHAIN=path/to/aarch64-linux-gnu
+ *   LIBIIO=../libiio/install
+ *   ${TOOLCHAIN}-gcc -o ad5940_bia_demo ad5940_bia_demo.c \
+ *       -I${LIBIIO}/include/iio \
+ *       -L${LIBIIO}/lib \
+ *       -liio -lm -lpthread -lrt -static
+ *
+ * Usage:
+ *   ./ad5940_bia_demo                    # default: 100 samples
+ *   ./ad5940_bia_demo 0                  # run forever until Ctrl-C
+ *   ./ad5940_bia_demo 500                # collect 500 samples
+ *
+ * Prerequisites:
+ *   - ad5940 kernel module loaded
+ *   - IIO buffer enabled (or use AFE_enable.sh)
+ *
+ * Data flow:
+ *   AD5940 FIFO (4 words per measurement cycle):
+ *     word0 = Current DFT Real   (18-bit signed, bits[17:0])
+ *     word1 = Current DFT Imag
+ *     word2 = Voltage DFT Real
+ *     word3 = Voltage DFT Imag
+ *
+ *   Impedance calculation (from ADI BodyImpedance.c AppBIAISR()):
+ *     |Z| = |V| / |I| * Rtia
+ *     angle(Z) = angle(V) - angle(I)
+ *   where Rtia is the HSTIA feedback resistor (default 1kOhm for HSTIARTIA_1K).
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+#include <iio.h>
+
+/* ------------------------------------------------------------------ */
+/*  BIA parameters — must match kernel driver configuration           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Rtia: HSTIA feedback resistor value in Ohms.
+ * HstiaRtiaSel = HSTIARTIA_1K → Rtia = 1000 Ohm
+ *
+ * Note: ADI's AppBIAISR() uses RtiaCurrValue[] from AD5940_HSRtiaCal()
+ * which returns the calibrated Rtia (magnitude + phase). For this demo
+ * we use the nominal 1kOhm value. For precision measurements, you should
+ * run the Rtia calibration procedure and substitute the calibrated value.
+ */
+#define RTIA_NOMINAL_OHM	1000.0f
+
+/*
+ * Excitation frequency — used for display only.
+ */
+#define EXCITATION_FREQ_HZ	50000.0f
+
+/* Each measurement cycle produces 4 FIFO words (DFT real+imag x 2) */
+#define NUM_CHANNELS		4
+
+/* ------------------------------------------------------------------ */
+/*  DFT data parsing helpers                                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * sign_extend_18bit — Convert 18-bit two's complement to int32_t
+ *
+ * AD5940 DFT results are 18-bit signed values in bits[17:0] of a
+ * 32-bit FIFO word. Bit17 is the sign bit.
+ * This matches ADI's AppBIAISR() logic:
+ *   pData[i] &= 0x3ffff;
+ *   if(pData[i]&(1<<17)) pData[i] |= 0xfffc0000;
+ */
+static inline int32_t sign_extend_18bit(uint32_t raw)
+{
+	raw &= 0x3FFFF;
+	if (raw & (1U << 17))
+		raw |= 0xFFFC0000;
+	return (int32_t)raw;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Impedance calculation (mirrors ADI AppBIAISR)                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+	float magnitude;	/* |Z| in Ohms */
+	float phase;		/* angle(Z) in degrees */
+	float resistance;	/* Real part R in Ohms */
+	float reactance;	/* Imaginary part X in Ohms */
+} bia_impedance_t;
+
+/*
+ * compute_impedance — Calculate impedance from DFT voltage and current
+ *
+ * Formula (from ADI BodyImpedance.c):
+ *   VoltMag   = sqrt(Vr^2 + Vi^2)
+ *   VoltPhase = atan2(-Vi, Vr)      // Note: ADI negates imaginary
+ *   CurrMag   = sqrt(Ir^2 + Ii^2)
+ *   CurrPhase = atan2(-Ii, Ir)
+ *   |Z|       = VoltMag / CurrMag * Rtia
+ *   angle(Z)  = VoltPhase - CurrPhase
+ */
+static void compute_impedance(int32_t curr_real, int32_t curr_imag,
+			      int32_t volt_real, int32_t volt_imag,
+			      float rtia, bia_impedance_t *result)
+{
+	float vr = (float)volt_real;
+	float vi = (float)volt_imag;
+	float ir = (float)curr_real;
+	float ii = (float)curr_imag;
+
+	float volt_mag   = sqrtf(vr * vr + vi * vi);
+	float volt_phase = atan2f(-vi, vr);	/* ADI convention */
+	float curr_mag   = sqrtf(ir * ir + ii * ii);
+	float curr_phase = atan2f(-ii, ir);
+
+	if (curr_mag < 1e-6f) {
+		result->magnitude  = 0.0f;
+		result->phase      = 0.0f;
+		result->resistance = 0.0f;
+		result->reactance  = 0.0f;
+		return;
+	}
+
+	float z_mag   = volt_mag / curr_mag * rtia;
+	float z_phase = volt_phase - curr_phase;
+
+	float z_phase_deg = z_phase * 180.0f / (float)M_PI;
+
+	result->magnitude  = z_mag;
+	result->phase      = z_phase_deg;
+	result->resistance = z_mag * cosf(z_phase);
+	result->reactance  = z_mag * sinf(z_phase);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Signal handling                                                   */
+/* ------------------------------------------------------------------ */
+
+static volatile sig_atomic_t keep_running = 1;
+
+static void sigint_handler(int sig)
+{
+	(void)sig;
+	keep_running = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main program                                                      */
+/* ------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+	struct iio_context *ctx = NULL;
+	struct iio_device  *dev = NULL;
+	struct iio_channel *ch[NUM_CHANNELS] = {NULL};
+	struct iio_buffer  *buf = NULL;
+	struct iio_channels_mask *mask = NULL;
+	struct iio_stream  *stream = NULL;
+
+	int max_samples = 100;
+	int sample_count = 0;
+	int ret = 0;
+
+	if (argc > 1) {
+		max_samples = atoi(argv[1]);
+		if (max_samples < 0)
+			max_samples = 0;	/* 0 = run forever */
+	}
+
+	signal(SIGINT, sigint_handler);
+	signal(SIGTERM, sigint_handler);
+
+	/* ---- Create IIO context (local) ---- */
+	ctx = iio_create_context(NULL, "local:");
+	if (iio_err(ctx)) {
+		fprintf(stderr, "ERROR: Cannot create local IIO context: %s\n",
+			strerror(-iio_err(ctx)));
+		return 1;
+	}
+
+	/*
+	 * Set timeout: BIA ODR is 5Hz (200ms period). Use 5s timeout
+	 * to tolerate startup delay and occasional late data.
+	 * A value of 0 means no timeout (wait indefinitely).
+	 */
+	iio_context_set_timeout(ctx, 5000);
+
+	/* ---- Find AD5940 device ---- */
+	dev = iio_context_find_device(ctx, "ad5940");
+	if (!dev) {
+		fprintf(stderr, "ERROR: Cannot find IIO device 'ad5940'. "
+			"Is the kernel module loaded?\n");
+		ret = 1;
+		goto cleanup;
+	}
+
+	printf("AD5940 BIA Impedance Demo (libiio v%u.%u)\n",
+	       iio_context_get_version_major(ctx),
+	       iio_context_get_version_minor(ctx));
+	printf("Device: %s, Channels: %u\n",
+	       iio_device_get_name(dev) ? iio_device_get_name(dev) : "ad5940",
+	       iio_device_get_channels_count(dev));
+
+	/* ---- Get channels ---- */
+	ch[0] = iio_device_find_channel(dev, "current0", false);
+	ch[1] = iio_device_find_channel(dev, "current1", false);
+	ch[2] = iio_device_find_channel(dev, "voltage0", false);
+	ch[3] = iio_device_find_channel(dev, "voltage1", false);
+
+	for (int i = 0; i < NUM_CHANNELS; i++) {
+		if (!ch[i]) {
+			fprintf(stderr, "ERROR: Cannot find channel index %d\n", i);
+			ret = 1;
+			goto cleanup;
+		}
+	}
+
+	/* ---- Get buffer (pre-allocated by kernel driver) ---- */
+	buf = iio_device_get_buffer(dev, 0);
+	if (iio_err(buf)) {
+		fprintf(stderr, "ERROR: Cannot get IIO buffer (index 0): %s\n",
+			strerror(-iio_err(buf)));
+		ret = 1;
+		goto cleanup;
+	}
+
+	/* ---- Create channels mask and enable channels ---- */
+	mask = iio_create_channels_mask(iio_device_get_channels_count(dev));
+	if (!mask) {
+		fprintf(stderr, "ERROR: Cannot create channels mask\n");
+		ret = 1;
+		goto cleanup;
+	}
+
+	for (int i = 0; i < NUM_CHANNELS; i++)
+		iio_channel_enable(ch[i], mask);
+
+	/* ---- Create stream ---- */
+	/*
+	 * iio_buffer_create_stream: creates nb_blocks blocks, each holding
+	 * samples_count samples. For 1-sample-per-block low-latency reads,
+	 * use nb_blocks=4, samples_count=1.
+	 */
+	stream = iio_buffer_create_stream(buf, 4, 1, mask);
+	if (iio_err(stream)) {
+		fprintf(stderr, "ERROR: Cannot create IIO stream: %s\n",
+			strerror(-iio_err(stream)));
+		ret = 1;
+		goto cleanup;
+	}
+
+	printf("\nCollecting %s samples (Ctrl-C to stop)...\n",
+	       max_samples ? "up to N" : "continuous");
+	printf("Rtia = %.0f Ohm (nominal), Excitation = %.0f Hz\n\n",
+	       RTIA_NOMINAL_OHM, EXCITATION_FREQ_HZ);
+	printf("%-6s %12s %12s %12s %12s %12s %12s  %s\n",
+	       "#", "|Z|(Ohm)", "Phase(deg)", "R(Ohm)", "X(Ohm)",
+	       "CurrMag", "VoltMag", "CurrDFT(R/I) VoltDFT(R/I)");
+	printf("------ ------------ ------------ ------------ ------------ "
+	       "------------ ------------  -----------------------\n");
+
+	/* ---- Main data acquisition loop ---- */
+	while (keep_running) {
+		const struct iio_block *block;
+
+		block = iio_stream_get_next_block(stream);
+		if (iio_err(block)) {
+			if (!keep_running)
+				break;
+			fprintf(stderr, "Stream read error: %s\n",
+				strerror(-iio_err(block)));
+			ret = 1;
+			break;
+		}
+		if (!block) {
+			/* Should not happen, but be safe */
+			break;
+		}
+
+		/*
+		 * Extract raw channel data using iio_channel_read().
+		 * raw=true: read samples in hardware format (18-bit in 32-bit word),
+		 *           no scale/offset conversion by libiio.
+		 */
+		int32_t raw[NUM_CHANNELS];
+		for (int i = 0; i < NUM_CHANNELS; i++) {
+			size_t nr = iio_channel_read(ch[i], block,
+						     &raw[i], sizeof(int32_t),
+						     true);
+			if (nr < sizeof(int32_t)) {
+				fprintf(stderr, "Channel %d: short read (%zu)\n",
+					i, nr);
+				break;
+			}
+		}
+
+		/* Sign-extend 18-bit DFT values */
+		int32_t curr_real = sign_extend_18bit((uint32_t)raw[0]);
+		int32_t curr_imag = sign_extend_18bit((uint32_t)raw[1]);
+		int32_t volt_real = sign_extend_18bit((uint32_t)raw[2]);
+		int32_t volt_imag = sign_extend_18bit((uint32_t)raw[3]);
+
+		/* Compute impedance */
+		bia_impedance_t z;
+		compute_impedance(curr_real, curr_imag,
+				  volt_real, volt_imag,
+				  RTIA_NOMINAL_OHM, &z);
+
+		/* Diagnostic magnitudes */
+		float curr_mag = sqrtf((float)curr_real * curr_real +
+				       (float)curr_imag * curr_imag);
+		float volt_mag = sqrtf((float)volt_real * volt_real +
+				       (float)volt_imag * volt_imag);
+
+		sample_count++;
+		printf("%-6d %12.2f %12.2f %12.2f %12.2f %12.1f %12.1f  "
+		       "(%d/%d) (%d/%d)\n",
+		       sample_count, z.magnitude, z.phase,
+		       z.resistance, z.reactance,
+		       curr_mag, volt_mag,
+		       curr_real, curr_imag, volt_real, volt_imag);
+
+		if (max_samples > 0 && sample_count >= max_samples)
+			break;
+	}
+
+	printf("\n--- Summary ---\n");
+	printf("Samples collected: %d\n", sample_count);
+	if (sample_count > 0)
+		printf("Rtia = %.0f Ohm (nominal, uncalibrated)\n",
+		       RTIA_NOMINAL_OHM);
+
+cleanup:
+	if (stream)
+		iio_stream_destroy(stream);
+	if (mask)
+		iio_channels_mask_destroy(mask);
+	if (ctx)
+		iio_context_destroy(ctx);
+
+	return ret;
+}

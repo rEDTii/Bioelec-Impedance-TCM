@@ -6,6 +6,10 @@
  * IIO device registration with triggered buffer, and trigger ops.
  * Low-level register access lives in ad5940_core.c.
  *
+ * Phase 1: BIA (Body Impedance) measurement, single-frequency 50kHz,
+ * 4-wire, DFT=8192, FIFO threshold interrupt, WUPT-driven periodic
+ * measurement via AD5940 sequencer.
+ *
  * DTS:
  *	&spi1 {
  *	pinctrl-0 = <&spi1m1_cs0 &spi1m1_pins>;
@@ -38,54 +42,32 @@
 #include "ad5940_core.h"
 
 /* ------------------------------------------------------------------ */
-/*  IIO channel definitions – DFT impedance mode                     */
+/*  IIO channel definitions – DFT impedance mode (BIA 4-wire)        */
 /* ------------------------------------------------------------------ */
 
 /*
  * AD5940 FIFO in DFT (FIFOSRC_DFT) mode outputs 4 words per measurement
- * cycle.  The FIFO word order is determined by the Sequencer program and
- * ADC MUX switching sequence — it is NOT fixed by hardware.
+ * cycle.  The FIFO word order is determined by the Sequencer program's
+ * ADC MUX switching sequence.
  *
- * Current channel mapping follows the BIA (BodyImpedance) example:
- *   BodyImpedance.c measures in 2 ADC MUX steps per cycle:
- *     Step 1: ADC MUX = HSTIA_P/HSTIA_N → DFT of current through RTIA
- *     Step 2: ADC MUX = AIN3/AIN2       → DFT of voltage across body
- *   Since Step 1 runs first, current DFT enters FIFO before voltage DFT.
+ * BIA 4-wire measurement (BodyImpedance.c):
+ *   Step 1: ADC MUX = HSTIA_P/HSTIA_N → DFT of current through RTIA
+ *   Step 2: ADC MUX = AIN3/AIN2       → DFT of voltage across body
  *
- *   FIFO word order (BIA, 4-wire):
- *     word0 = Current Real     (iImpCar_Type: pDftCurr->Real)
- *     word1 = Current Imag     (iImpCar_Type: pDftCurr->Image)
- *     word2 = Voltage Real     (iImpCar_Type: pDftVolt->Real)
- *     word3 = Voltage Imag     (iImpCar_Type: pDftVolt->Image)
+ *   FIFO word order:
+ *     word0 = Current Real     (pDftCurr->Real)
+ *     word1 = Current Imag     (pDftCurr->Image)
+ *     word2 = Voltage Real     (pDftVolt->Real)
+ *     word3 = Voltage Imag     (pDftVolt->Image)
  *
  *   Electrode configuration (BIA, 4-wire):
  *     Current path:  CE0 → body → AIN1 → HSTIA (RTIA)
  *     Voltage sense: AIN3(+) / AIN2(-) — independent high-Z detection
  *
- *   Reference: ad5940_example/AD5940_BIA/BodyImpedance.c
- *     - AppBIADataProcess(): pDftCurr = pSrcData++, pDftVolt = pSrcData++
- *     - Measure sequence: ADC MUX HSTIA first, then AIN3/AIN2
- *
- * DFT FIFO word format (differs from standard 16-bit data):
- *   - Standard ADC data: 16-bit, mask = 0xFFFF
- *   - DFT result:        18-bit signed two's complement in bits[17:0]
- *     Bit17 is the sign bit.  ADI examples sign-extend with:
- *       pData[i] &= 0x3FFFF;
- *       if (pData[i] & (1L << 17)) pData[i] |= 0xFFFC0000;
- *
- * scan_type is set to s18/32>>0 to describe the raw FIFO format.
- * The driver pushes raw 32-bit FIFO words directly; sign-extension
- * is handled by user-space libiio based on the _type attribute
- * ("le:s18/32>>0").  This also facilitates future SPI DMA transfers
- * where raw FIFO data can be memcpy'd into the IIO buffer without
- * any per-sample CPU processing.
- *
- * No info_mask is set: data is available exclusively via triggered buffer.
- * Sysfs read_raw / write_raw are not provided for these channels.
- *
- * NOTE: If switching to a different measurement configuration (e.g.
- * Impedance, BIOZ-2Wire, BIA_HiZ), the FIFO word order may change.
- * Update the scan_index assignments and this comment accordingly.
+ * DFT FIFO word format: 18-bit signed two's complement in bits[17:0]
+ *   Bit17 is the sign bit.
+ *   scan_type = s18/32>>0 — raw 32-bit FIFO words pushed directly;
+ *   sign-extension handled by user-space libiio based on _type attr.
  */
 
 #define AD5940_DFT_CURR_REAL	0
@@ -155,40 +137,34 @@ static const struct iio_chan_spec ad5940_dft_channels[] = {
 /* ------------------------------------------------------------------ */
 
 /*
- * The trigger is driven by the AD5940 GPIO interrupt (FIFO threshold
- * or data-ready).  set_trigger_state enables/disables the interrupt
- * source inside the AFE.
+ * ad5940_trigger_set_state - Enable/disable the FIFO threshold interrupt
+ *
+ * Called by IIO core when buffer is enabled/disabled.
+ * When buffer is enabled (state=true): start WUPT for periodic measurement.
+ * When buffer is disabled (state=false): stop WUPT.
  */
 static int ad5940_trigger_set_state(struct iio_trigger *trig, bool state)
 {
 	struct ad5940_priv *priv = iio_trigger_get_drvdata(trig);
-	int ret = 0;
+	struct device *dev = &priv->spi->dev;
 
-	if (state) {
-		/*
-		 * TODO: Enable FIFO threshold interrupt in AD5940
-		 * interrupt controller.  Placeholder: enable AFE.
-		 */
-		dev_info(&priv->spi->dev, "ad5940_trigger_set_state 1\n");
+	dev_info(dev, "trigger_set_state: %s\n", state ? "ENABLE" : "DISABLE");
 
-		// ret = ad5940_spi_write(priv, AD5940_REG_AFECON,
-		// 		       AD5940_AFECON_FIFOEN);
-	} else {
-		/* TODO: Disable FIFO threshold interrupt */
-
-		dev_info(&priv->spi->dev, "ad5940_trigger_set_state 0\n");
-
-		// ret = ad5940_spi_write(priv, AD5940_REG_AFECON, 0);
-	}
-
-	return ret;
+	if (state)
+		return ad5940_bia_start(priv);
+	else
+		return ad5940_bia_stop(priv);
 }
 
+/*
+ * ad5940_trigger_reenable - Re-enable IRQ after trigger handler completes
+ *
+ * Called by IIO core via try_reenable after iio_trigger_notify_done().
+ * Re-enables the Linux IRQ that was disabled in ad5940_irq_handler().
+ */
 static int ad5940_trigger_reenable(struct iio_trigger *trig)
 {
 	struct ad5940_priv *priv = iio_trigger_get_drvdata(trig);
-
-	dev_info(&priv->spi->dev, "ad5940_trigger_reenable\n");
 
 	enable_irq(priv->irq);
 	return 0;
@@ -204,23 +180,14 @@ static const struct iio_trigger_ops ad5940_trigger_ops = {
 /* ------------------------------------------------------------------ */
 
 /*
- * Called from the IRQ thread when the AD5940 asserts data-ready.
- * Reads FIFO samples and pushes them into the IIO buffer.
+ * ad5940_trigger_handler - Read FIFO DFT data and push to IIO buffer
  *
- * In BIA 4-wire DFT mode the FIFO outputs 4 words per measurement cycle:
- *   word0 = Current Real,  word1 = Current Imag,
- *   word2 = Voltage Real,  word3 = Voltage Imag.
+ * Called from the IIO trigger poll thread after GPIO interrupt.
+ * Reads 4 FIFO words (current real/imag + voltage real/imag) and
+ * pushes them into the IIO buffer with a timestamp.
  *
- * This order matches the Sequencer program's ADC MUX switching:
- *   Step 1: HSTIA_P/HSTIA_N (current) → DFT → FIFO word0,1
- *   Step 2: AIN3/AIN2       (voltage) → DFT → FIFO word2,3
- *
- * Each FIFO word contains an 18-bit signed DFT result in bits[17:0]
- * (bit17 is the sign bit).  We push the raw 32-bit FIFO words directly
- * into the IIO buffer without sign-extension; user-space libiio handles
- * the 18-bit sign extension based on the channel's _type attribute
- * ("le:s18/32>>0").  This approach also enables future SPI DMA support
- * where raw FIFO data can be memcpy'd without per-sample CPU processing.
+ * The FIFO source is FIFOSRC_DFT. Each DFT result consists of
+ * a real and imaginary part, both 18-bit signed in a 32-bit word.
  */
 static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 {
@@ -228,48 +195,100 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	struct iio_dev *indio_dev = pf->indio_dev;
 	struct ad5940_priv *priv = iio_priv(indio_dev);
 
-	dev_info(&priv->spi->dev, "ad5940_trigger_handler\n");
+	/*
+	 * Buffer layout for iio_push_to_buffers_with_timestamp():
+	 *   4 × u32 channel data  +  1 × s64 timestamp
+	 * The timestamp is appended after channel data by the framework,
+	 * so we must reserve space for it to avoid stack overflow.
+	 */
+	u32 buf[AD5940_DFT_CHANNELS + sizeof(s64) / sizeof(u32)];
+	int ret, fifo_cnt;
 
-	// /*
-	//  * Buffer layout for iio_push_to_buffers_with_timestamp():
-	//  *   4 × u32 channel data  +  1 × s64 timestamp
-	//  * The timestamp is appended after channel data by the framework,
-	//  * so we must reserve space for it to avoid stack overflow.
-	//  */
-	// u32 buf[AD5940_DFT_CHANNELS + sizeof(s64) / sizeof(u32)];
-	// int ret, fifo_cnt;
+	memset(buf, 0, sizeof(buf));
 
-	// memset(buf, 0, sizeof(buf));
+	/* Wake up AFE (it may be in hibernate between measurements) */
+	ret = ad5940_wakeup(priv);
+	if (ret) {
+		dev_err(&priv->spi->dev, "FIFO read: wakeup failed: %d\n",
+			ret);
+		goto out;
+	}
 
-	// ret = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
-	// if (ret < 0) {
-	// 	dev_err(&priv->spi->dev, "FIFO count read failed: %d\n",
-	// 		ret);
-	// 	goto out;
-	// }
-	// /* FIFOCNTSTA.DATAFIFOCNTSTA is in bits[26:16], per AD5940 datasheet */
-	// fifo_cnt = ret >> 16;
+	/* Lock sleep key during FIFO read (prevent hibernate mid-read).
+	 * ADI: AD5940_SleepKeyCtrlS(SLPKEY_LOCK) - use 0 (any wrong value locks)
+	 */
+	ad5940_spi_write(priv, AD5940_REG_SEQSLPLOCK, AD5940_SLPKEY_LOCK);
 
-	// /*
-	//  * TODO: Handle fifo_cnt > 4 (multiple measurement cycles in FIFO).
-	//  * For now, read exactly one DFT frame (4 words).
-	//  *
-	//  * Use ad5940_fifo_read() which sets the FIFO address once then
-	//  * reads words sequentially — matching ADI's recommended method
-	//  * for small read counts (< 3 words per CS toggle).
-	//  * It returns 0 on success (data via output param), avoiding the
-	//  * ambiguity of ad5940_spi_read() where 32-bit FIFO data with
-	//  * bit31 set would be indistinguishable from a negative errno.
-	//  */
-	// ret = ad5940_fifo_read(priv, buf, AD5940_DFT_CHANNELS);
-	// if (ret) {
-	// 	dev_err(&priv->spi->dev, "FIFO read failed: %d\n", ret);
-	// 	goto out;
-	// }
+	/* ---- Debug: read key registers after measurement cycle ---- */
+	{
+		static int dbg_cnt;
+		int adccon, dsw, psw, nsw, tsw, swcon;
 
-	// iio_push_to_buffers_with_timestamp(indio_dev, buf,
-	// 				   iio_get_time_ns(indio_dev));
-// out:
+		if (dbg_cnt < 3) {
+			adccon = ad5940_spi_read(priv, AD5940_REG_ADCCON);
+			dsw = ad5940_spi_read(priv, AD5940_REG_DSWFULLCON);
+			psw = ad5940_spi_read(priv, AD5940_REG_PSWFULLCON);
+			nsw = ad5940_spi_read(priv, AD5940_REG_NSWFULLCON);
+			tsw = ad5940_spi_read(priv, AD5940_REG_TSWFULLCON);
+			swcon = ad5940_spi_read(priv, AD5940_REG_SWCON);
+			dev_info(&priv->spi->dev,
+				 "DBG[%d] ADCCON=0x%x MUXP=%d MUXN=%d PGA=%d | "
+				 "SW D=0x%x P=0x%x N=0x%x T=0x%x SWCON=0x%x\n",
+				 dbg_cnt, adccon,
+				 adccon & 0x3F, (adccon >> 8) & 0x1F,
+				 (adccon >> 16) & 0x7,
+				 dsw, psw, nsw, tsw, swcon);
+			dbg_cnt++;
+		}
+	}
+
+	/* Read FIFO count to check how many words are available */
+	ret = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
+	if (ret < 0) {
+		dev_err(&priv->spi->dev, "FIFO count read failed: %d\n",
+			ret);
+		goto out;
+	}
+	/* FIFOCNTSTA.DATAFIFOCNTSTA is in bits[26:16], per AD5940 datasheet */
+	fifo_cnt = ret >> 16;
+
+	/*
+	 * Read exactly one DFT frame (4 words).
+	 *
+	 * TODO: Handle fifo_cnt > 4 (multiple measurement cycles in FIFO).
+	 * For now, if there are more than 4 words, we read 4 and the
+	 * remaining words will be picked up on the next interrupt.
+	 * If fifo_cnt < 4, something is wrong — read what's available.
+	 */
+	if (fifo_cnt < AD5940_DFT_CHANNELS) {
+		dev_warn(&priv->spi->dev,
+			 "FIFO underrun: %d words (expected %d)\n",
+			 fifo_cnt, AD5940_DFT_CHANNELS);
+		if (fifo_cnt == 0)
+			goto out;
+	}
+
+	ret = ad5940_fifo_read(priv, buf,
+			       min(fifo_cnt, AD5940_DFT_CHANNELS));
+	if (ret) {
+		dev_err(&priv->spi->dev, "FIFO read failed: %d\n", ret);
+		goto out;
+	}
+
+	/* Clear FIFO threshold interrupt flag in AD5940 INTC */
+	ad5940_spi_write(priv, AD5940_REG_INTCCLR,
+			 AD5940_AFEINTSRC_DATAFIFOTHRESH);
+
+	/* Unlock sleep key (allow AFE to hibernate after next measurement) */
+	ad5940_spi_write(priv, AD5940_REG_SEQSLPLOCK,
+			 AD5940_SLPKEY_UNLOCK);
+
+	/* Push data to IIO buffer (only if we have a full frame) */
+	if (fifo_cnt >= AD5940_DFT_CHANNELS)
+		iio_push_to_buffers_with_timestamp(indio_dev, buf,
+						   iio_get_time_ns(indio_dev));
+
+out:
 	iio_trigger_notify_done(indio_dev->trig);
 	return IRQ_HANDLED;
 }
@@ -289,23 +308,26 @@ static const struct iio_info ad5940_iio_info = {
 /*  IRQ handler                                                       */
 /* ------------------------------------------------------------------ */
 
+/*
+ * ad5940_irq_handler - Hard IRQ handler for AD5940 GPIO interrupt
+ *
+ * Called when AD5940 GP0 pin goes low (FIFO threshold reached).
+ * Disables IRQ to prevent re-entry, then schedules the IIO trigger
+ * poll which will run ad5940_trigger_handler in thread context.
+ */
 static irqreturn_t ad5940_irq_handler(int irq, void *dev_id)
 {
 	struct iio_dev *indio_dev = dev_id;
 	struct ad5940_priv *priv = iio_priv(indio_dev);
 
-	dev_info(&priv->spi->dev, "ad5940_irq_handler\n");
+
+	// dev_info(&priv->spi->dev, "Enter ad5940_irq_handler\n");
 
 	/*
 	 * Disable IRQ to prevent re-entry until the trigger handler
 	 * finishes and calls iio_trigger_notify_done() → reenable().
 	 */
 	disable_irq_nosync(priv->irq);
-
-	/*
-	 * TODO: Read INTCFLAG to determine interrupt source (FIFO
-	 * threshold, sequencer done, etc.) and act accordingly.
-	 */
 
 	iio_trigger_poll(priv->trig);
 
@@ -325,8 +347,6 @@ static int ad5940_setup_trigger(struct iio_dev *indio_dev)
 	priv->trig = devm_iio_trigger_alloc(dev, "%s-dev%d",
 					     indio_dev->name,
 					     indio_dev->id);
-
-	dev_info(dev, "iio trig name: %s-dev%d\n", indio_dev->name, indio_dev->id);
 
 	if (!priv->trig)
 		return -ENOMEM;
@@ -351,11 +371,6 @@ static int ad5940_setup_trigger(struct iio_dev *indio_dev)
 	 * and only take a device reference (get_device) to keep the
 	 * trigger's struct device alive — matching the put_device()
 	 * in ad5940_remove().
-	 *
-	 * Setting indio_dev->trig = NULL in remove() prevents
-	 * iio_device_unregister_trigger_consumer() from calling
-	 * iio_trigger_put(), which would otherwise do an unpaired
-	 * module_put().
 	 */
 	indio_dev->trig = priv->trig;
 	get_device(&priv->trig->dev);
@@ -392,10 +407,7 @@ static int ad5940_probe(struct spi_device *spi)
 	priv->spi = spi;
 	priv->iio_dev = indio_dev;
 
-	/* Setup SPI: CPOL=0, CPHA=0 (SPI mode 0)
-	 * Per AD5940 datasheet, CS asserts before the first SCLK rising
-	 * edge, implying SCLK idles LOW. ADI examples confirm CPOL=0.
-	 */
+	/* Setup SPI: CPOL=0, CPHA=0 (SPI mode 0) */
 	spi->mode = SPI_MODE_0;
 	spi->max_speed_hz = 4000000;
 	spi->bits_per_word = 8;
@@ -413,21 +425,17 @@ static int ad5940_probe(struct spi_device *spi)
 		return ret;
 	}
 
-	/* Hardware reset */
+	/* ---- Hardware reset ---- */
 	ad5940_reset(priv);
 
-	/*
-	 * Apply post-reset initialization register sequence.
-	 * AD5940 is in active state right after hardware reset, so we can
-	 * write registers directly.
-	 */
+	/* ---- Apply post-reset init register sequence ---- */
 	ret = ad5940_init(priv);
 	if (ret) {
 		dev_err(dev, "AFE initialization failed\n");
 		return ret;
 	}
 
-	/* Read chip identification */
+	/* ---- Read chip identification ---- */
 	adiid = ad5940_spi_read(priv, AD5940_REG_ADIID);
 	if (adiid < 0) {
 		dev_err(dev, "failed to read ADIID: %d\n", adiid);
@@ -451,13 +459,29 @@ static int ad5940_probe(struct spi_device *spi)
 		dev_warn(dev, "unexpected CHIPID: 0x%04x (expected 0x%04x)\n",
 			 chipid, AD5940_CHIPID_VALUE);
 
+	/* ---- BIA initialization (Phase 1) ---- */
+	/*
+	 * Initialize AD5940 for BIA measurement:
+	 * - Configure all AFE registers (reference, HSLoop, LPLoop, DSP)
+	 * - Program init sequence (SEQID_1) and measure sequence (SEQID_0)
+	 *   into sequencer SRAM
+	 * - Configure FIFO (DFT source, threshold=4)
+	 * - Configure interrupt controller (FIFO threshold → GP0)
+	 * - Execute init sequence once
+	 *
+	 * Measurement is NOT started here — it starts when the IIO buffer
+	 * is enabled, which calls ad5940_trigger_set_state(true),
+	 * which calls ad5940_bia_start() to configure the Wakeup Timer.
+	 */
+	ret = ad5940_bia_init(priv);
+	if (ret) {
+		dev_err(dev, "BIA initialization failed: %d\n", ret);
+		return ret;
+	}
+
 	/* ---- IIO device configuration ---- */
 	indio_dev->name		= "ad5940";
 	indio_dev->info		= &ad5940_iio_info;
-	/* INDIO_DIRECT_MODE: sysfs 单次读取（当前未提供 read_raw）
-	 * INDIO_BUFFER_TRIGGERED: 通过 trigger + buffer 连续采集
-	 * INDIO_BUFFER_HARDWARE 不需要——那是给硬件 FIFO 直推的（如 DMA buffer），4.19 用的是 kfifo 后端
-	 */
 	indio_dev->modes	= INDIO_DIRECT_MODE | INDIO_BUFFER_TRIGGERED;
 	indio_dev->channels	= ad5940_dft_channels;
 	indio_dev->num_channels	= ARRAY_SIZE(ad5940_dft_channels);
@@ -507,6 +531,9 @@ static int ad5940_remove(struct spi_device *spi)
 	struct iio_dev *indio_dev = spi_get_drvdata(spi);
 	struct ad5940_priv *priv = iio_priv(indio_dev);
 
+	/* Stop BIA measurement (disable WUPT) */
+	ad5940_bia_stop(priv);
+
 	/*
 	 * Clear the trigger association before devm cleanup runs.
 	 * This prevents iio_device_unregister_trigger_consumer()
@@ -523,7 +550,7 @@ static int ad5940_remove(struct spi_device *spi)
 	gpiod_set_value(priv->reset_gpio, 1);
 
 	dev_info(&spi->dev, "ad5940_driver removed.\n");
-	
+
 	return 0;
 }
 
@@ -548,5 +575,5 @@ static struct spi_driver ad5940_driver = {
 module_spi_driver(ad5940_driver);
 
 MODULE_AUTHOR("Mason Wang");
-MODULE_DESCRIPTION("AD5940 AFE SPI driver with IIO support");
+MODULE_DESCRIPTION("AD5940 AFE SPI driver with IIO BIA support");
 MODULE_LICENSE("GPL");
