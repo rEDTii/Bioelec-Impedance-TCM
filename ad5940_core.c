@@ -930,87 +930,87 @@ int ad5940_bia_start(struct ad5940_priv *priv)
 	if (ret)
 		return ret;
 
-	/* ---- Debug: read status registers after WUPT start ---- */
-	{
-		u32 seqcon, fifocon, fifocnt_raw, fifocnt, intcflag0, intcflag1;
-		u32 afecon, wuptcon, cmddatacon, dftcon, adcfiltercon;
-		u32 seq0info, seq1info, intcsel0, intcsel1, fifothres;
-		u32 seqcnt;
+	// /* ---- Debug: read status registers after WUPT start ---- */
+	// {
+	// 	u32 seqcon, fifocon, fifocnt_raw, fifocnt, intcflag0, intcflag1;
+	// 	u32 afecon, wuptcon, cmddatacon, dftcon, adcfiltercon;
+	// 	u32 seq0info, seq1info, intcsel0, intcsel1, fifothres;
+	// 	u32 seqcnt;
 
-		/* Quick snapshot at 10ms to see if sequence starts */
-		msleep(10);
-		ad5940_wakeup(priv);
-		afecon = ad5940_spi_read(priv, AD5940_REG_AFECON);
-		seqcon = ad5940_spi_read(priv, AD5940_REG_SEQCON);
-		seqcnt = ad5940_spi_read(priv, AD5940_REG_SEQCNT);
-		fifocnt_raw = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
-		fifocnt = (fifocnt_raw & AD5940_FIFOCNT_DATAFIFOCNT_MASK)
-			  >> AD5940_FIFOCNT_DATAFIFOCNT_SHIFT;
-		intcflag1 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG1);
-		dev_info(dev, "BIA debug @10ms: AFECON=0x%x SEQCON=0x%x SEQCNT=%u FIFOCNT=%u INTF1=0x%x\n",
-			 afecon, seqcon, seqcnt & 0xFFFF, fifocnt, intcflag1);
+	// 	/* Quick snapshot at 10ms to see if sequence starts */
+	// 	msleep(10);
+	// 	ad5940_wakeup(priv);
+	// 	afecon = ad5940_spi_read(priv, AD5940_REG_AFECON);
+	// 	seqcon = ad5940_spi_read(priv, AD5940_REG_SEQCON);
+	// 	seqcnt = ad5940_spi_read(priv, AD5940_REG_SEQCNT);
+	// 	fifocnt_raw = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
+	// 	fifocnt = (fifocnt_raw & AD5940_FIFOCNT_DATAFIFOCNT_MASK)
+	// 		  >> AD5940_FIFOCNT_DATAFIFOCNT_SHIFT;
+	// 	intcflag1 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG1);
+	// 	dev_info(dev, "BIA debug @10ms: AFECON=0x%x SEQCON=0x%x SEQCNT=%u FIFOCNT=%u INTF1=0x%x\n",
+	// 		 afecon, seqcon, seqcnt & 0xFFFF, fifocnt, intcflag1);
 
-		/* Snapshot at 100ms (first DFT should be complete) */
-		msleep(90);
-		ad5940_wakeup(priv);
-		afecon = ad5940_spi_read(priv, AD5940_REG_AFECON);
-		seqcnt = ad5940_spi_read(priv, AD5940_REG_SEQCNT);
-		fifocnt_raw = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
-		fifocnt = (fifocnt_raw & AD5940_FIFOCNT_DATAFIFOCNT_MASK)
-			  >> AD5940_FIFOCNT_DATAFIFOCNT_SHIFT;
-		intcflag1 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG1);
-		dev_info(dev, "BIA debug @100ms: AFECON=0x%x SEQCNT=%u FIFOCNT=%u INTF1=0x%x\n",
-			 afecon, seqcnt & 0xFFFF, fifocnt, intcflag1);
+	// 	/* Snapshot at 100ms (first DFT should be complete) */
+	// 	msleep(90);
+	// 	ad5940_wakeup(priv);
+	// 	afecon = ad5940_spi_read(priv, AD5940_REG_AFECON);
+	// 	seqcnt = ad5940_spi_read(priv, AD5940_REG_SEQCNT);
+	// 	fifocnt_raw = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
+	// 	fifocnt = (fifocnt_raw & AD5940_FIFOCNT_DATAFIFOCNT_MASK)
+	// 		  >> AD5940_FIFOCNT_DATAFIFOCNT_SHIFT;
+	// 	intcflag1 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG1);
+	// 	dev_info(dev, "BIA debug @100ms: AFECON=0x%x SEQCNT=%u FIFOCNT=%u INTF1=0x%x\n",
+	// 		 afecon, seqcnt & 0xFFFF, fifocnt, intcflag1);
 
-		/* Full register dump at 300ms (at least one full measure cycle done) */
-		msleep(200);
-		ad5940_wakeup(priv);
+	// 	/* Full register dump at 300ms (at least one full measure cycle done) */
+	// 	msleep(200);
+	// 	ad5940_wakeup(priv);
 
-		seqcon = ad5940_spi_read(priv, AD5940_REG_SEQCON);
-		seqcnt = ad5940_spi_read(priv, AD5940_REG_SEQCNT);
-		afecon = ad5940_spi_read(priv, AD5940_REG_AFECON);
-		fifocon = ad5940_spi_read(priv, AD5940_REG_FIFOCON);
-		fifocnt_raw = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
-		fifocnt = (fifocnt_raw & AD5940_FIFOCNT_DATAFIFOCNT_MASK)
-			  >> AD5940_FIFOCNT_DATAFIFOCNT_SHIFT;
-		intcflag0 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG0);
-		intcflag1 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG1);
-		wuptcon = ad5940_spi_read(priv, AD5940_REG_WUPTCON);
-		cmddatacon = ad5940_spi_read(priv, AD5940_REG_CMDDATACON);
-		dftcon = ad5940_spi_read(priv, AD5940_REG_DFTCON);
-		adcfiltercon = ad5940_spi_read(priv, AD5940_REG_ADCFILTERCON);
-		seq0info = ad5940_spi_read(priv, AD5940_REG_SEQ0INFO);
-		seq1info = ad5940_spi_read(priv, AD5940_REG_SEQ1INFO);
-		intcsel0 = ad5940_spi_read(priv, AD5940_REG_INTCSEL0);
-		intcsel1 = ad5940_spi_read(priv, AD5940_REG_INTCSEL1);
-		fifothres = ad5940_spi_read(priv, AD5940_REG_DATAFIFOTHRES);
+	// 	seqcon = ad5940_spi_read(priv, AD5940_REG_SEQCON);
+	// 	seqcnt = ad5940_spi_read(priv, AD5940_REG_SEQCNT);
+	// 	afecon = ad5940_spi_read(priv, AD5940_REG_AFECON);
+	// 	fifocon = ad5940_spi_read(priv, AD5940_REG_FIFOCON);
+	// 	fifocnt_raw = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
+	// 	fifocnt = (fifocnt_raw & AD5940_FIFOCNT_DATAFIFOCNT_MASK)
+	// 		  >> AD5940_FIFOCNT_DATAFIFOCNT_SHIFT;
+	// 	intcflag0 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG0);
+	// 	intcflag1 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG1);
+	// 	wuptcon = ad5940_spi_read(priv, AD5940_REG_WUPTCON);
+	// 	cmddatacon = ad5940_spi_read(priv, AD5940_REG_CMDDATACON);
+	// 	dftcon = ad5940_spi_read(priv, AD5940_REG_DFTCON);
+	// 	adcfiltercon = ad5940_spi_read(priv, AD5940_REG_ADCFILTERCON);
+	// 	seq0info = ad5940_spi_read(priv, AD5940_REG_SEQ0INFO);
+	// 	seq1info = ad5940_spi_read(priv, AD5940_REG_SEQ1INFO);
+	// 	intcsel0 = ad5940_spi_read(priv, AD5940_REG_INTCSEL0);
+	// 	intcsel1 = ad5940_spi_read(priv, AD5940_REG_INTCSEL1);
+	// 	fifothres = ad5940_spi_read(priv, AD5940_REG_DATAFIFOTHRES);
 
-		dev_info(dev, "BIA debug @300ms:\n");
-		dev_info(dev, "  SEQCON=0x%x SEQCNT=%u AFECON=0x%x FIFOCON=0x%x\n",
-			 seqcon, seqcnt & 0xFFFF, afecon, fifocon);
-		dev_info(dev, "  FIFOCNT=0x%x(raw) FIFOCNT=%u INTCFLAG0=0x%x INTCFLAG1=0x%x\n",
-			 fifocnt_raw, fifocnt, intcflag0, intcflag1);
-		dev_info(dev, "  WUPTCON=0x%x CMDDATACON=0x%x\n",
-			 wuptcon, cmddatacon);
-		dev_info(dev, "  DFTCON=0x%x ADCFILTERCON=0x%x\n",
-			 dftcon, adcfiltercon);
-		dev_info(dev, "  SEQ0INFO=0x%x SEQ1INFO=0x%x\n",
-			 seq0info, seq1info);
-		dev_info(dev, "  INTCSEL0=0x%x INTCSEL1=0x%x FIFOTHRES=0x%x\n",
-			 intcsel0, intcsel1, fifothres);
+	// 	dev_info(dev, "BIA debug @300ms:\n");
+	// 	dev_info(dev, "  SEQCON=0x%x SEQCNT=%u AFECON=0x%x FIFOCON=0x%x\n",
+	// 		 seqcon, seqcnt & 0xFFFF, afecon, fifocon);
+	// 	dev_info(dev, "  FIFOCNT=0x%x(raw) FIFOCNT=%u INTCFLAG0=0x%x INTCFLAG1=0x%x\n",
+	// 		 fifocnt_raw, fifocnt, intcflag0, intcflag1);
+	// 	dev_info(dev, "  WUPTCON=0x%x CMDDATACON=0x%x\n",
+	// 		 wuptcon, cmddatacon);
+	// 	dev_info(dev, "  DFTCON=0x%x ADCFILTERCON=0x%x\n",
+	// 		 dftcon, adcfiltercon);
+	// 	dev_info(dev, "  SEQ0INFO=0x%x SEQ1INFO=0x%x\n",
+	// 		 seq0info, seq1info);
+	// 	dev_info(dev, "  INTCSEL0=0x%x INTCSEL1=0x%x FIFOTHRES=0x%x\n",
+	// 		 intcsel0, intcsel1, fifothres);
 
-		/* Also do a second read after another 500ms (multiple WUPT cycles) */
-		msleep(500);
-		ad5940_wakeup(priv);
-		fifocnt_raw = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
-		fifocnt = (fifocnt_raw & AD5940_FIFOCNT_DATAFIFOCNT_MASK)
-			  >> AD5940_FIFOCNT_DATAFIFOCNT_SHIFT;
-		intcflag0 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG0);
-		intcflag1 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG1);
-		afecon = ad5940_spi_read(priv, AD5940_REG_AFECON);
-		dev_info(dev, "BIA debug @800ms: FIFOCNT=%u INTF0=0x%x INTF1=0x%x AFECON=0x%x\n",
-			 fifocnt, intcflag0, intcflag1, afecon);
-	}
+	// 	/* Also do a second read after another 500ms (multiple WUPT cycles) */
+	// 	msleep(500);
+	// 	ad5940_wakeup(priv);
+	// 	fifocnt_raw = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
+	// 	fifocnt = (fifocnt_raw & AD5940_FIFOCNT_DATAFIFOCNT_MASK)
+	// 		  >> AD5940_FIFOCNT_DATAFIFOCNT_SHIFT;
+	// 	intcflag0 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG0);
+	// 	intcflag1 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG1);
+	// 	afecon = ad5940_spi_read(priv, AD5940_REG_AFECON);
+	// 	dev_info(dev, "BIA debug @800ms: FIFOCNT=%u INTF0=0x%x INTF1=0x%x AFECON=0x%x\n",
+	// 		 fifocnt, intcflag0, intcflag1, afecon);
+	// }
 
 	dev_info(dev, "BIA: measurement started (ODR=%dHz, ADI flow replicated)\n",
 		 AD5940_BIA_ODR);

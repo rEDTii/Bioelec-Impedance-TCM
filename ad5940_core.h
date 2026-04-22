@@ -711,17 +711,21 @@ static const u32 ad5940_bia_measure_seq[] = {
 		(AD5940_ADCMUXP_AIN3 << AD5940_ADCCON_MUXSELP_SHIFT) |
 		(AD5940_ADCMUXN_AIN2 << AD5940_ADCCON_MUXSELN_SHIFT)),
 
-	/* Enable WG + ADC power */
+	/* Enable WG + ADC power + start ADC conversion (flush S/H cap) */
 	SEQ_WR(AD5940_REG_AFECON,
 		AD5940_AFECON_HSDACPWR | AD5940_AFECON_EXTBUFPWR |
 		AD5940_AFECON_INAMPPWR | AD5940_AFECON_HSTIAPWR |
 		AD5940_AFECON_DACREFPWR | AD5940_AFECON_SINC2NOTCH |
-		AD5940_AFECON_WG | AD5940_AFECON_ADCPWR),
+		AD5940_AFECON_WG | AD5940_AFECON_ADCPWR |
+		AD5940_AFECON_ADCCNV),
 
-	/* Wait 50us for signal settling */
-	SEQ_WAIT(800),
+	/* Wait 200us for MUX switch to settle + flush old sample data.
+	 * ADC at 800ksps with SINC3OSR=2 gives ~400k samples/s.
+	 * 200us = ~80 ADC samples, enough to fully flush SINC3 pipeline.
+	 */
+	SEQ_WAIT(3200),
 
-	/* Start ADC conversion + DFT */
+	/* Now start DFT (ADC already converting with new MUX) */
 	SEQ_WR(AD5940_REG_AFECON,
 		AD5940_AFECON_HSDACPWR | AD5940_AFECON_EXTBUFPWR |
 		AD5940_AFECON_INAMPPWR | AD5940_AFECON_HSTIAPWR |

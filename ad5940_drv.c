@@ -202,9 +202,11 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	 * so we must reserve space for it to avoid stack overflow.
 	 */
 	u32 buf[AD5940_DFT_CHANNELS + sizeof(s64) / sizeof(u32)];
+	// u32 raw16[16];  /* for reading all 16 FIFO words when threshold=16 */
 	int ret, fifo_cnt;
 
 	memset(buf, 0, sizeof(buf));
+	// memset(raw16, 0, sizeof(raw16));
 
 	/* Wake up AFE (it may be in hibernate between measurements) */
 	ret = ad5940_wakeup(priv);
@@ -224,7 +226,7 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 		static int dbg_cnt;
 		int adccon, dsw, psw, nsw, tsw, swcon;
 
-		if (dbg_cnt < 3) {
+		if (dbg_cnt < 16) {
 			adccon = ad5940_spi_read(priv, AD5940_REG_ADCCON);
 			dsw = ad5940_spi_read(priv, AD5940_REG_DSWFULLCON);
 			psw = ad5940_spi_read(priv, AD5940_REG_PSWFULLCON);
@@ -252,6 +254,17 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	/* FIFOCNTSTA.DATAFIFOCNTSTA is in bits[26:16], per AD5940 datasheet */
 	fifo_cnt = ret >> 16;
 
+	/* DEBUG: print FIFOCNT raw value and extracted count */
+	{
+		static int _dbg_cnt;
+		if (_dbg_cnt < 16) {
+			dev_info(&priv->spi->dev,
+				 "FIFO: raw=0x%x cnt=%d\n",
+				 ret, fifo_cnt);
+			_dbg_cnt++;
+		}
+	}
+
 	/*
 	 * Read exactly one DFT frame (4 words).
 	 *
@@ -274,6 +287,19 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 		dev_err(&priv->spi->dev, "FIFO read failed: %d\n", ret);
 		goto out;
 	}
+
+	/* DEBUG: print raw FIFO words */
+	{
+		static int _raw_cnt;
+		if (_raw_cnt < 16) {
+			dev_info(&priv->spi->dev,
+					"RAW1: %08x %08x %08x %08x\n",
+					buf[0], buf[1], buf[2], buf[3]);
+			_raw_cnt++;
+		}
+	}
+
+
 
 	/* Clear FIFO threshold interrupt flag in AD5940 INTC */
 	ad5940_spi_write(priv, AD5940_REG_INTCCLR,
