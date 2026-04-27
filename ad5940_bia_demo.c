@@ -21,11 +21,12 @@
  *   - IIO buffer enabled (or use AFE_enable.sh)
  *
  * Data flow:
- *   AD5940 FIFO (4 words per measurement cycle):
+ *   AD5940 FIFO (4 words per measurement cycle) + 1 frequency word:
  *     word0 = Current DFT Real   (18-bit signed, bits[17:0])
  *     word1 = Current DFT Imag
  *     word2 = Voltage DFT Real
  *     word3 = Voltage DFT Imag
+ *     word4 = Excitation Frequency (32-bit unsigned, in Hz)
  *
  *   Impedance calculation (from ADI BodyImpedance.c AppBIAISR()):
  *     |Z| = |V| / |I| * Rtia
@@ -58,13 +59,9 @@
  */
 #define RTIA_NOMINAL_OHM	1000.0f
 
-/*
- * Excitation frequency — used for display only.
- */
-#define EXCITATION_FREQ_HZ	50000.0f
-
-/* Each measurement cycle produces 4 FIFO words (DFT real+imag x 2) */
-#define NUM_CHANNELS		4
+/* Each measurement cycle produces 4 FIFO words + 1 frequency word */
+#define NUM_DFT_CHANNELS	4
+#define NUM_CHANNELS		5
 
 /* ------------------------------------------------------------------ */
 /*  DFT data parsing helpers                                          */
@@ -216,6 +213,7 @@ int main(int argc, char *argv[])
 	ch[1] = iio_device_find_channel(dev, "current1", false);
 	ch[2] = iio_device_find_channel(dev, "voltage0", false);
 	ch[3] = iio_device_find_channel(dev, "voltage1", false);
+	ch[4] = iio_device_find_channel(dev, "altvoltage0", false);
 
 	for (int i = 0; i < NUM_CHANNELS; i++) {
 		if (!ch[i]) {
@@ -261,12 +259,12 @@ int main(int argc, char *argv[])
 
 	printf("\nCollecting %s samples (Ctrl-C to stop)...\n",
 	       max_samples ? "up to N" : "continuous");
-	printf("Rtia = %.0f Ohm (nominal), Excitation = %.0f Hz\n\n",
-	       RTIA_NOMINAL_OHM, EXCITATION_FREQ_HZ);
-	printf("%-6s %12s %12s %12s %12s %12s %12s  %s\n",
-	       "#", "|Z|(Ohm)", "Phase(deg)", "R(Ohm)", "X(Ohm)",
+	printf("Rtia = %.0f Ohm (nominal), Frequency from driver\n\n",
+	       RTIA_NOMINAL_OHM);
+	printf("%-6s %10s %12s %12s %12s %12s %12s %12s  %s\n",
+	       "#", "Freq(Hz)", "|Z|(Ohm)", "Phase(deg)", "R(Ohm)", "X(Ohm)",
 	       "CurrMag", "VoltMag", "CurrDFT(R/I) VoltDFT(R/I)");
-	printf("------ ------------ ------------ ------------ ------------ "
+	printf("------ ---------- ------------ ------------ ------------ ------------ "
 	       "------------ ------------  -----------------------\n");
 
 	/* ---- Main data acquisition loop ---- */
@@ -310,6 +308,9 @@ int main(int argc, char *argv[])
 		int32_t volt_real = sign_extend_18bit((uint32_t)raw[2]);
 		int32_t volt_imag = sign_extend_18bit((uint32_t)raw[3]);
 
+		/* Frequency channel: unsigned 32-bit Hz value from driver */
+		uint32_t freq_hz = (uint32_t)raw[4];
+
 		/* Compute impedance */
 		bia_impedance_t z;
 		compute_impedance(curr_real, curr_imag,
@@ -323,9 +324,9 @@ int main(int argc, char *argv[])
 				       (float)volt_imag * volt_imag);
 
 		sample_count++;
-		printf("%-6d %12.2f %12.2f %12.2f %12.2f %12.1f %12.1f  "
+		printf("%-6d %10u %12.2f %12.2f %12.2f %12.2f %12.1f %12.1f  "
 		       "(%d/%d) (%d/%d)\n",
-		       sample_count, z.magnitude, z.phase,
+		       sample_count, freq_hz, z.magnitude, z.phase,
 		       z.resistance, z.reactance,
 		       curr_mag, volt_mag,
 		       curr_real, curr_imag, volt_real, volt_imag);

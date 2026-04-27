@@ -42,6 +42,26 @@
 #include "ad5940_core.h"
 
 /* ------------------------------------------------------------------ */
+/*  Module parameters for frequency sweep configuration                */
+/* ------------------------------------------------------------------ */
+
+static bool sweep_en;
+module_param(sweep_en, bool, 0644);
+MODULE_PARM_DESC(sweep_en, "Enable frequency sweep (default: 0)");
+
+static uint sweep_start_hz = 10000;
+module_param(sweep_start_hz, uint, 0644);
+MODULE_PARM_DESC(sweep_start_hz, "Sweep start frequency in Hz (default: 10000)");
+
+static uint sweep_stop_hz = 150000;
+module_param(sweep_stop_hz, uint, 0644);
+MODULE_PARM_DESC(sweep_stop_hz, "Sweep stop frequency in Hz (default: 150000)");
+
+static uint sweep_points = 100;
+module_param(sweep_points, uint, 0644);
+MODULE_PARM_DESC(sweep_points, "Number of sweep frequency points (default: 100)");
+
+/* ------------------------------------------------------------------ */
 /*  IIO channel definitions – DFT impedance mode (BIA 4-wire)        */
 /* ------------------------------------------------------------------ */
 
@@ -74,7 +94,8 @@
 #define AD5940_DFT_CURR_IMAG	1
 #define AD5940_DFT_VOLT_REAL	2
 #define AD5940_DFT_VOLT_IMAG	3
-#define AD5940_DFT_TIMESTAMP	4
+#define AD5940_DFT_FREQ		4
+#define AD5940_DFT_TIMESTAMP	5
 
 static const struct iio_chan_spec ad5940_dft_channels[] = {
 	[AD5940_DFT_CURR_REAL] = {
@@ -128,7 +149,20 @@ static const struct iio_chan_spec ad5940_dft_channels[] = {
 			.shift		= 0,
 			.endianness	= IIO_CPU,
 		},
-	}, 
+	},
+	[AD5940_DFT_FREQ] = {
+		.type			= IIO_ALTVOLTAGE,
+		.indexed		= 1,
+		.channel		= 0,
+		.scan_index		= AD5940_DFT_FREQ,
+		.scan_type		= {
+			.sign		= 'u',
+			.realbits	= 32,
+			.storagebits	= 32,
+			.shift		= 0,
+			.endianness	= IIO_CPU,
+		},
+	},
 	[AD5940_DFT_TIMESTAMP] = IIO_CHAN_SOFT_TIMESTAMP(AD5940_DFT_TIMESTAMP),
 };
 
@@ -202,7 +236,7 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 
 	/*
 	 * Buffer layout for iio_push_to_buffers_with_timestamp():
-	 *   4 × u32 channel data  +  1 × s64 timestamp
+	 *   4 × u32 DFT data + 1 × u32 frequency  +  1 × s64 timestamp
 	 * The timestamp is appended after channel data by the framework,
 	 * so we must reserve space for it to avoid stack overflow.
 	 */
@@ -335,7 +369,8 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	 * This ensures we always read complete DFT frames and leaves
 	 * any partial frame for the next interrupt.
 	 */
-	read_cnt = (fifo_cnt / AD5940_DFT_CHANNELS) * AD5940_DFT_CHANNELS;
+	read_cnt = (fifo_cnt / AD5940_FIFO_WORDS_PER_FRAME) *
+		   AD5940_FIFO_WORDS_PER_FRAME;
 
 	// /* DEBUG: print FIFOCNT raw value and extracted count */
 	// {
@@ -361,9 +396,9 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	 * ADI reads all frames in one FIFORd call then processes;
 	 * we read frame-by-frame since IIO needs per-frame timestamps.
 	 */
-	frames = read_cnt / AD5940_DFT_CHANNELS;
+	frames = read_cnt / AD5940_FIFO_WORDS_PER_FRAME;
 	for (frame = 0; frame < frames; frame++) {
-		ret = ad5940_fifo_read(priv, buf, AD5940_DFT_CHANNELS);
+		ret = ad5940_fifo_read(priv, buf, AD5940_FIFO_WORDS_PER_FRAME);
 		if (ret) {
 			dev_err(&priv->spi->dev,
 				"FIFO read failed at frame %d/%d: %d\n",
@@ -371,19 +406,21 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 			goto out_clear;
 		}
 
-		// /* DEBUG: print raw FIFO words (first 2 frames only) */
-		// if (frame < 2) {
-		// 	static int _raw_cnt;
-		// 	if (_raw_cnt < 16) {
-		// 		dev_info(&priv->spi->dev,
-		// 			 "RAW[%d]: %08x %08x %08x %08x\n",
-		// 			 frame, buf[0], buf[1], buf[2], buf[3]);
-		// 		_raw_cnt++;
-		// 	}
-		// }
+		/* Fill frequency channel with current measurement frequency */
+		buf[AD5940_DFT_FREQ] = priv->freq_of_data_hz;
 
 		iio_push_to_buffers_with_timestamp(indio_dev, buf,
 						   iio_get_time_ns(indio_dev));
+
+		/* Advance sweep state and update WGFCW for next cycle */
+		if (priv->sweep_en) {
+			ret = ad5940_bia_sweep_step(priv);
+			if (ret) {
+				dev_err(&priv->spi->dev,
+					"sweep step failed: %d\n", ret);
+				goto out_clear;
+			}
+		}
 	}
 
 out_clear:
@@ -514,6 +551,19 @@ static int ad5940_probe(struct spi_device *spi)
 	priv = iio_priv(indio_dev);
 	priv->spi = spi;
 	priv->iio_dev = indio_dev;
+
+	/* Configure sweep from module parameters */
+	priv->sweep_en = sweep_en;
+	priv->sweep_type = AD5940_SWEEP_LINEAR;
+	priv->sweep_start_hz = sweep_start_hz;
+	priv->sweep_stop_hz = sweep_stop_hz;
+	priv->sweep_points = clamp_val(sweep_points, 1,
+				       AD5940_MAX_SWEEP_POINTS);
+	if (priv->sweep_en) {
+		dev_info(dev, "Sweep: %uHz - %uHz, %u points, linear\n",
+			 priv->sweep_start_hz, priv->sweep_stop_hz,
+			 priv->sweep_points);
+	}
 
 	/* Setup SPI: CPOL=0, CPHA=0 (SPI mode 0) */
 	spi->mode = SPI_MODE_0;

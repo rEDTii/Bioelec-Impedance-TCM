@@ -411,8 +411,10 @@
 #define AD5940_RESET_PULSE_MS	10
 #define AD5940_RESET_WAIT_MS	10
 #define AD5940_WAKEUP_RETRIES	10
-#define AD5940_FIFO_THRESHOLD	4
-#define AD5940_DFT_CHANNELS	4
+#define AD5940_FIFO_THRESHOLD		4
+#define AD5940_FIFO_WORDS_PER_FRAME	4	/* FIFO words per DFT measurement cycle */
+#define AD5940_DFT_CHANNELS		5	/* IIO scan channels: 4 DFT + 1 frequency */
+#define AD5940_MAX_SWEEP_POINTS		100
 
 /*
  * BIA ODR and WUPT clock frequency.
@@ -568,6 +570,11 @@ struct ad5940_rtia_cal_result {
 	s64	imag_mohm;
 };
 
+/* Sweep type - extensible for future modes (e.g. logarithmic) */
+enum ad5940_sweep_type {
+	AD5940_SWEEP_LINEAR = 0,
+};
+
 /**
  * struct ad5940_priv - AD5940 driver private data
  *
@@ -576,7 +583,20 @@ struct ad5940_rtia_cal_result {
  * @irq:        Linux IRQ number from DT
  * @trig:       IIO trigger (data-ready / FIFO threshold)
  * @iio_dev:    Pointer back to the IIO device (for use in trigger ops)
- * @rtia_cal:   RTIA calibration result from init-time calibration
+ * @rtia_cal:   RTIA calibration result (current/active value)
+ * @running:    true when WUPT is active and measurements are in progress
+ * @irq_disabled: tracks whether our hard IRQ handler has called
+ *   disable_irq_nosync() without a matching enable_irq()
+ * @sweep_en:   frequency sweep enable
+ * @sweep_type: sweep type (linear, etc.)
+ * @sweep_start_hz:  sweep start frequency in Hz
+ * @sweep_stop_hz:   sweep stop frequency in Hz
+ * @sweep_points:    number of frequency points in sweep
+ * @sweep_index:     current sweep position (0 .. sweep_points-1)
+ * @sweep_curr_freq_hz:  frequency currently being measured
+ * @sweep_next_freq_hz:  frequency for next WUPT cycle
+ * @freq_of_data_hz:     frequency of the most recent FIFO data
+ * @rtia_cal_table:  per-frequency RTIA calibration results
  */
 struct ad5940_priv {
 	struct spi_device		*spi;
@@ -602,6 +622,18 @@ struct ad5940_priv {
 	 */
 	bool			running;
 	bool			irq_disabled;
+
+	/* Frequency sweep configuration and state */
+	bool			sweep_en;
+	enum ad5940_sweep_type	sweep_type;
+	u32			sweep_start_hz;
+	u32			sweep_stop_hz;
+	u32			sweep_points;
+	u32			sweep_index;
+	u32			sweep_curr_freq_hz;
+	u32			sweep_next_freq_hz;
+	u32			freq_of_data_hz;
+	struct ad5940_rtia_cal_result rtia_cal_table[AD5940_MAX_SWEEP_POINTS];
 };
 
 /* ---- Core register access API ---- */
@@ -623,5 +655,11 @@ int ad5940_bia_start(struct ad5940_priv *priv);
 int ad5940_bia_stop(struct ad5940_priv *priv);
 int ad5940_seq_cmd_write(struct ad5940_priv *priv,
 			 u32 start_addr, const u32 *cmd, int count);
+
+/* ---- Frequency sweep helpers ---- */
+u32 ad5940_wg_freq_word_cal(u32 freq_hz, u32 sysclk_hz);
+u32 ad5940_sweep_calc_freq(u32 start_hz, u32 stop_hz, u32 points,
+			    enum ad5940_sweep_type type, u32 index);
+int ad5940_bia_sweep_step(struct ad5940_priv *priv);
 
 #endif /* _AD5940_CORE_H_ */
