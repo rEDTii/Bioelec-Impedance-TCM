@@ -54,6 +54,10 @@
 #define AD5940_REG_DFTCON		0x20D0
 #define AD5940_REG_LPTIACON0		0x20EC
 #define AD5940_REG_BUFSENCON		0x2180
+#define AD5940_REG_DFTREAL		0x2078  /* DFT Result, Real Part */
+#define AD5940_REG_DFTIMAG		0x207C  /* DFT Result, Imaginary Part */
+#define AD5940_REG_LPREFBUFCON		0x2050  /* LP Reference Buffer Config */
+#define AD5940_REG_DE0RESCON		0x20F8  /* DE0 HSTIA Resistors Config */
 #define AD5940_REG_ADCCON		0x21A8
 #define AD5940_REG_ADCFILTERCON		0x2044
 #define AD5940_REG_ADCMIN		0x20A8
@@ -209,9 +213,14 @@
 
 /* ADC MUX enum values - Source: ADCMUXP_xxx, ADCMUXN_xxx in ad5940.h */
 #define AD5940_ADCMUXP_HSTIA_P		1
+#define AD5940_ADCMUXP_P_NODE		0x24	/* Buffered excitation P node */
 #define AD5940_ADCMUXP_AIN3		7
 #define AD5940_ADCMUXN_HSTIA_N		1
+#define AD5940_ADCMUXN_N_NODE		0x14	/* Buffered excitation N node */
 #define AD5940_ADCMUXN_AIN2		6
+
+/* ADC PGA gain values */
+#define AD5940_ADCPGA_1P5		1
 
 /* ADCFILTERCON bits - Source: BITP_AFE_ADCFILTERCON_* */
 #define AD5940_ADCFILTERCON_ADCCLK_SHIFT	0	/* bit0: 0=1.6MHz, 1=800kHz */
@@ -252,6 +261,7 @@
 #define AD5940_PMBW_SYSBW_SHIFT			2
 
 /* INTC interrupt source flags */
+#define AD5940_AFEINTSRC_DFTRDY		BIT(1)
 #define AD5940_AFEINTSRC_DATAFIFOTHRESH		BIT(25)
 #define AD5940_AFEINTSRC_ENDSEQ			BIT(15)
 #define AD5940_AFEINTSRC_ALLINT			0xFFFFFFFF
@@ -297,7 +307,21 @@
 #define AD5940_HSTIADERLOAD_OPEN	5
 
 /* HSTIADERTIA enum values (for DeRtia field, bits[7:3]) */
+#define AD5940_HSTIADERTIA_TODE	10
 #define AD5940_HSTIADERTIA_OPEN	0x1F
+
+/* HSTIABIAS enum values */
+#define AD5940_HSTIABIAS_1P1		0
+
+/* HSRTIACON additional bit fields */
+#define AD5940_HSRTIACON_TIASW6CON	BIT(4)	/* DiodeClose switch */
+#define AD5940_HSRTIACON_RTIACON_MASK	0x0F
+
+/* LPREFBUFCON bits - Source: BITM_AFE_LPREFBUFCON_* in ad5940.h */
+#define AD5940_LPREFBUFCON_LPBUF2P5DIS	BIT(1)
+
+/* AFECTRL_ALL - all AFE control signal bits */
+#define AD5940_AFECTRL_ALL		0x39FFE0
 
 /* LPDACSW switch enum values */
 #define AD5940_LPDACSW_VZERO2HSTIA	0x01
@@ -530,6 +554,21 @@ static const struct {
 /* ================================================================== */
 
 /**
+ * struct ad5940_rtia_cal_result - RTIA calibration result
+ *
+ * @magnitude_mohm:  RTIA magnitude in milliohms
+ * @phase_mdeg:      RTIA phase in millidegrees
+ * @real_mohm:       RTIA real part in milliohms
+ * @imag_mohm:       RTIA imaginary part in milliohms
+ */
+struct ad5940_rtia_cal_result {
+	s64	magnitude_mohm;
+	s32	phase_mdeg;
+	s64	real_mohm;
+	s64	imag_mohm;
+};
+
+/**
  * struct ad5940_priv - AD5940 driver private data
  *
  * @spi:        SPI device handle
@@ -537,17 +576,21 @@ static const struct {
  * @irq:        Linux IRQ number from DT
  * @trig:       IIO trigger (data-ready / FIFO threshold)
  * @iio_dev:    Pointer back to the IIO device (for use in trigger ops)
+ * @rtia_cal:   RTIA calibration result from init-time calibration
  */
 struct ad5940_priv {
-	struct spi_device	*spi;
-	struct gpio_desc	*reset_gpio;
-	int			irq;
+	struct spi_device		*spi;
+	struct gpio_desc		*reset_gpio;
+	int				irq;
 
 	/* IIO trigger (FIFO threshold / data-ready) */
-	struct iio_trigger	*trig;
+	struct iio_trigger		*trig;
 
 	/* Pointer back to the IIO device (for use in trigger ops) */
-	struct iio_dev		*iio_dev;
+	struct iio_dev			*iio_dev;
+
+	/* RTIA calibration result */
+	struct ad5940_rtia_cal_result	rtia_cal;
 
 	/*
 	 * Measurement state tracking.
@@ -567,6 +610,7 @@ int ad5940_spi_xfer(struct ad5940_priv *priv,
 		    const u8 *tx, u8 *rx, size_t len);
 int ad5940_spi_write(struct ad5940_priv *priv, u16 reg, u32 val);
 int ad5940_spi_read(struct ad5940_priv *priv, u16 reg);
+int ad5940_spi_read32(struct ad5940_priv *priv, u16 reg, u32 *val);
 int ad5940_fifo_read(struct ad5940_priv *priv, u32 *buf, int count);
 void ad5940_reset(struct ad5940_priv *priv);
 int ad5940_wakeup(struct ad5940_priv *priv);
@@ -574,6 +618,7 @@ int ad5940_init(struct ad5940_priv *priv);
 
 /* ---- BIA measurement API ---- */
 int ad5940_bia_init(struct ad5940_priv *priv);
+int ad5940_bia_rtia_cal(struct ad5940_priv *priv);
 int ad5940_bia_start(struct ad5940_priv *priv);
 int ad5940_bia_stop(struct ad5940_priv *priv);
 int ad5940_seq_cmd_write(struct ad5940_priv *priv,

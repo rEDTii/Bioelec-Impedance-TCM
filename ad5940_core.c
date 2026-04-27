@@ -132,6 +132,48 @@ int ad5940_spi_read(struct ad5940_priv *priv, u16 reg)
 EXPORT_SYMBOL_GPL(ad5940_spi_read);
 
 /**
+ * ad5940_spi_read32 - Read a 32-bit register into a u32 output parameter
+ * @priv: driver private data
+ * @reg: register address
+ * @val: output register value
+ *
+ * Unlike ad5940_spi_read() which returns int, this function stores the
+ * register value through a pointer and returns 0 on success / negative
+ * errno on failure. This avoids the ambiguity where a 32-bit register
+ * value with bit31 set (e.g. 0xFFFFFFFF) is indistinguishable from a
+ * negative errno when cast to int.
+ *
+ * Return: 0 on success, negative errno on failure
+ */
+int ad5940_spi_read32(struct ad5940_priv *priv, u16 reg, u32 *val)
+{
+	u8 tx[6], rx[6];
+	int ret;
+
+	if (reg < 0x1000 || reg > 0x3014)
+		return -EINVAL;
+
+	/* Phase 1: set address */
+	tx[0] = AD5940_SPI_CMD_SETADDR;
+	tx[1] = (reg >> 8) & 0xff;
+	tx[2] = reg & 0xff;
+	ret = ad5940_spi_xfer(priv, tx, rx, 3);
+	if (ret)
+		return ret;
+
+	/* Phase 2: full-duplex read (CMD + 1 dummy + 4 data = 6 bytes) */
+	memset(tx, 0, 6);
+	tx[0] = AD5940_SPI_CMD_READREG;
+	ret = ad5940_spi_xfer(priv, tx, rx, 6);
+	if (ret)
+		return ret;
+
+	*val = (rx[2] << 24) | (rx[3] << 16) | (rx[4] << 8) | rx[5];
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ad5940_spi_read32);
+
+/**
  * ad5940_fifo_read - Read one or more words from the data FIFO
  * @priv: driver private data
  * @buf: output buffer (must have room for @count u32 words)
@@ -856,6 +898,596 @@ static int ad5940_bia_gen_measure_seq(struct ad5940_priv *priv,
 	return sg.len;
 }
 
+/* ================================================================== */
+/*  RTIA Calibration - replicates ADI's AD5940_HSRtiaCal()            */
+/* ================================================================== */
+
+/*
+ * rtia_cal_afe_ctrl - Direct SPI AFE control (matching ADI's AFECtrlS)
+ * @priv: driver private data
+ * @ctrl_set: bits to modify (AFECTRL_* constants)
+ * @enable: true to enable, false to disable
+ *
+ * Exactly replicates AD5940_AFECtrlS() register behavior including
+ * the inverted semantics of HPREFPWR(bit5) and ALDOLIMIT(bit19).
+ */
+static int rtia_cal_afe_ctrl(struct ad5940_priv *priv, u32 ctrl_set,
+			      bool enable)
+{
+	u32 val, special = ctrl_set;
+	int ret;
+
+	ret = ad5940_spi_read32(priv, AD5940_REG_AFECON, &val);
+	if (ret)
+		return ret;
+
+	if (enable) {
+		if (ctrl_set & AD5940_AFECTRL_HPREFPWR) {
+			val &= ~AD5940_AFECON_HPREFDIS;
+			special &= ~AD5940_AFECTRL_HPREFPWR;
+		}
+		if (ctrl_set & AD5940_AFECTRL_ALDOLIMIT) {
+			val &= ~AD5940_AFECON_ALDOILIMITEN;
+			special &= ~AD5940_AFECTRL_ALDOLIMIT;
+		}
+		val |= special;
+	} else {
+		if (ctrl_set & AD5940_AFECTRL_HPREFPWR) {
+			val |= AD5940_AFECON_HPREFDIS;
+			special &= ~AD5940_AFECTRL_HPREFPWR;
+		}
+		if (ctrl_set & AD5940_AFECTRL_ALDOLIMIT) {
+			val |= AD5940_AFECON_ALDOILIMITEN;
+			special &= ~AD5940_AFECTRL_ALDOLIMIT;
+		}
+		val &= ~special;
+	}
+
+	return ad5940_spi_write(priv, AD5940_REG_AFECON, val);
+}
+
+/*
+ * rtia_cal_adc_mux_cfg - Direct SPI ADC MUX config (matching ADI's ADCMuxCfgS)
+ * @priv: driver private data
+ * @muxp: positive MUX selection
+ * @muxn: negative MUX selection
+ *
+ * RMW on ADCCON: preserve PGA, update MUXSELP and MUXSELN.
+ */
+static int rtia_cal_adc_mux_cfg(struct ad5940_priv *priv, u32 muxp, u32 muxn)
+{
+	u32 val;
+	int ret;
+
+	ret = ad5940_spi_read32(priv, AD5940_REG_ADCCON, &val);
+	if (ret)
+		return ret;
+	val &= ~(AD5940_ADCCON_MUXSELP_MASK | AD5940_ADCCON_MUXSELN_MASK);
+	val |= muxp << AD5940_ADCCON_MUXSELP_SHIFT;
+	val |= muxn << AD5940_ADCCON_MUXSELN_SHIFT;
+
+	return ad5940_spi_write(priv, AD5940_REG_ADCCON, val);
+}
+
+/*
+ * rtia_cal_wait_dft_ready - Poll INTCFLAG1 for DFTRDY via SPI
+ * @priv: driver private data
+ * @timeout_ms: maximum wait time in milliseconds
+ *
+ * Matches ADI's: while(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE);
+ * Uses SPI polling with ~100us intervals.
+ *
+ * Return: 0 on success, -ETIMEDOUT on timeout
+ */
+static int rtia_cal_wait_dft_ready(struct ad5940_priv *priv, int timeout_ms)
+{
+	int i, ret;
+
+	/* Poll at ~100us intervals, timeout_ms * 10 = number of polls */
+	for (i = 0; i < timeout_ms * 10; i++) {
+		u32 flag;
+
+		ret = ad5940_spi_read32(priv, AD5940_REG_INTCFLAG1, &flag);
+		if (ret)
+			 return ret;
+		if (flag & AD5940_AFEINTSRC_DFTRDY)
+			return 0;
+		usleep_range(80, 120);
+	}
+	return -ETIMEDOUT;
+}
+
+/*
+ * rtia_cal_atan2_mdeg - Integer atan2 in millidegrees using CORDIC
+ * @y: imaginary component
+ * @x: real component
+ *
+ * Returns angle in millidegrees, range [-180000, 180000].
+ * Uses CORDIC vectoring mode with 16 iterations for ~0.01° accuracy.
+ */
+static s32 rtia_cal_atan2_mdeg(s64 y, s64 x)
+{
+	static const s32 atan_table[16] = {
+		45000, 26565, 14036, 7125, 3576, 1789, 895, 448,
+		224, 112, 56, 28, 14, 7, 4, 2
+	};
+	s32 angle = 0;
+	int i;
+
+	if (x == 0 && y == 0)
+		return 0;
+
+	/* Normalize to fit 32-bit CORDIC range while preserving ratio */
+	while (x > 0x3FFFFFFF || x < -0x3FFFFFFF ||
+	       y > 0x3FFFFFFF || y < -0x3FFFFFFF) {
+		x >>= 1;
+		y >>= 1;
+	}
+
+	/* Handle 2nd/3rd quadrants via recursion */
+	if (x < 0) {
+		if (y >= 0)
+			return 180000 - rtia_cal_atan2_mdeg(y, -x);
+		else
+			return -180000 + rtia_cal_atan2_mdeg(-y, -x);
+	}
+
+	/* CORDIC vectoring mode: rotate vector towards x-axis */
+	for (i = 0; i < 16; i++) {
+		s64 x_new, y_new;
+
+		if (y >= 0) {
+			x_new = x + (y >> i);
+			y_new = y - (x >> i);
+			angle += atan_table[i];
+		} else {
+			x_new = x - (y >> i);
+			y_new = y + (x >> i);
+			angle -= atan_table[i];
+		}
+		x = x_new;
+		y = y_new;
+	}
+
+	return angle;
+}
+
+/**
+ * ad5940_bia_rtia_cal - Perform RTIA calibration
+ * @priv: driver private data
+ *
+ * Faithfully replicates ADI's AppBIARtiaCal() → AD5940_HSRtiaCal() flow
+ * with single-frequency calibration at 50kHz (matching AppBIACfg.SinFreq).
+ *
+ * BIA default parameters (from AppBIACfg):
+ *   RcalVal=10kΩ, HstiaRtiaSel=1K, CtiaSel=16, SinFreq=50kHz,
+ *   SysClkFreq=16MHz, AdcClkFreq=16MHz, ADCSinc3Osr=2, ADCSinc2Osr=22,
+ *   DftNum=8192, DftSrc=SINC3, HanWinEn=true
+ *
+ * Calibration procedure (6 phases matching AD5940_HSRtiaCal):
+ *   1. Parameter calculation (ExcitVolt, gain/amplitude settings)
+ *   2. AFE hardware configuration (REF, HSLoop, DSP)
+ *   3. Measure V_Rcal (ADC Mux = P_NODE/N_NODE)
+ *   4. Measure V_Rtia (ADC Mux = HSTIA_P/HSTIA_N)
+ *   5. Data post-processing (18-bit sign extension, negation)
+ *   6. Compute RTIA = (V_Rtia / V_Rcal) * Rcal
+ *
+ * Sweep framework: the outer loop structure is preserved for future
+ * multi-frequency calibration. Currently executes one iteration.
+ *
+ * Return: 0 on success, negative errno on failure
+ */
+int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
+{
+	struct device *dev = &priv->spi->dev;
+	int ret, i;
+	u32 val, intc1_saved;
+	s32 dft_rcal_real, dft_rcal_imag;
+	s32 dft_rtia_real, dft_rtia_imag;
+
+	/* ---- BIA RTIA calibration parameters ---- */
+	/* Matching AppBIACfg defaults used in AppBIARtiaCal() */
+	static const u32 hp_rtia_table[] = {
+		200, 1000, 5000, 10000, 20000, 40000, 80000, 160000
+	};
+	const u32 rcal_ohm = 10000;	/* RcalVal = 10kΩ */
+	const u32 rtia_sel = AD5940_HSTIARTIA_1K;
+	const u32 rtia_val = hp_rtia_table[rtia_sel]; /* 1000Ω */
+	const u32 ctia_val = 16;	/* CtiaSel */
+	const u32 freq_hz = 50000;	/* SinFreq = 50kHz */
+	const u32 sysclk_hz = 16000000; /* SysClkFreq = 16MHz */
+
+	/* ---- Phase 1: Parameter calculation ---- */
+	u32 excit_buf_gain, hs_dac_gain;
+	u32 excit_volt_mv; /* Excitation voltage in mVpp */
+	u32 wg_amp_word;
+	u32 freq_word;
+	u32 full_range_mv;
+
+	/* ExcitVolt = 1800 * 0.8 * Rcal / Rtia  (mVpp) */
+	excit_volt_mv = (u32)div_u64(1440ULL * rcal_ohm, rtia_val);
+
+	/* Gain/amplitude selection - matching AD5940_HSRtiaCal lines 3460-3490 */
+	if (excit_volt_mv <= 40) {		/* <= 800*0.05 */
+		excit_buf_gain = 1;	/* EXCITBUFGAIN_0P25 */
+		hs_dac_gain = 1;	/* HSDACGAIN_0P2 */
+		full_range_mv = 40;
+	} else if (excit_volt_mv <= 200) {	/* <= 800*0.25 */
+		excit_buf_gain = 1;
+		hs_dac_gain = 0;	/* HSDACGAIN_1 */
+		full_range_mv = 200;
+	} else if (excit_volt_mv <= 320) {	/* <= 800*0.4 */
+		excit_buf_gain = 0;	/* EXCITBUFGAIN_2 */
+		hs_dac_gain = 1;
+		full_range_mv = 320;
+	} else {
+		excit_buf_gain = 0;
+		hs_dac_gain = 0;
+		full_range_mv = 1600;
+	}
+
+	/* WgAmpWord = ((ExcitVolt/FullRange * 2047 * 2) + 1) >> 1 */
+	wg_amp_word = (u32)div_u64((u64)excit_volt_mv * 2047 * 2,
+				   full_range_mv);
+	wg_amp_word = (wg_amp_word + 1) >> 1;
+	if (wg_amp_word > 0x7FF)
+		wg_amp_word = 0x7FF;
+
+	/* WG frequency word: round(freq * 2^26 / sysclk), S1 silicon 26-bit */
+	freq_word = (u32)div_u64(((u64)freq_hz << 26) + sysclk_hz / 2,
+				 sysclk_hz);
+	if (freq_word > 0xFFFFF)
+		freq_word = 0xFFFFF;
+
+	dev_info(dev, "RTIA cal: ExcitVolt=%umVpp, WgAmp=0x%03x, FreqWord=0x%05x\n",
+		 excit_volt_mv, wg_amp_word, freq_word);
+
+	/* ---- Phase 2: AFE hardware configuration ---- */
+
+	/* 2a: INTC configuration - save INTCSEL1, enable DFTRDY in INTC1 */
+	/* AD5940_INTCGetCfg(AFEINTC_1) */
+	ad5940_spi_read32(priv, AD5940_REG_INTCSEL1, &intc1_saved);
+	/* AD5940_INTCCfg(AFEINTC_1, AFEINTSRC_DFTRDY, bTRUE) */
+	ret = ad5940_spi_read32(priv, AD5940_REG_INTCSEL1, &val);
+	if (ret)
+		return ret;
+	ad5940_spi_write(priv, AD5940_REG_INTCSEL1,
+			 val | AD5940_AFEINTSRC_DFTRDY);
+
+	/* 2b: AD5940_AFECtrlS(AFECTRL_ALL, bFALSE) - disable all AFE modules */
+	ret = rtia_cal_afe_ctrl(priv, AD5940_AFECTRL_ALL, false);
+	if (ret)
+		return ret;
+
+	/* 2c: REFCfgS - Configure reference system */
+	/* AFECON: clear HPREFDIS to enable HP bandgap */
+	ret = ad5940_spi_read32(priv, AD5940_REG_AFECON, &val);
+	if (ret)
+		return ret;
+	val &= ~AD5940_AFECON_HPREFDIS;
+	ad5940_spi_write(priv, AD5940_REG_AFECON, val);
+
+	/* BUFSENCON: enable HP 1.8V and 1.1V buffers */
+	ret = ad5940_spi_read32(priv, AD5940_REG_BUFSENCON, &val);
+	if (ret)
+		return ret;
+	val |= AD5940_BUFSENCON_V1P8HPADCEN | AD5940_BUFSENCON_V1P1HPADCEN;
+	ad5940_spi_write(priv, AD5940_REG_BUFSENCON, val);
+
+	/* LPREFBUFCON: disable LP references (set disable bits) */
+	ad5940_spi_write(priv, AD5940_REG_LPREFBUFCON,
+			 AD5940_LPREFBUFCON_LPREFDIS |
+			 AD5940_LPREFBUFCON_LPBUF2P5DIS);
+
+	/* 2d: HSLoopCfgS - Configure HP loop */
+	/* HSDACCON: ExcitBufGain + HsDacGain + UpdateRate=7 */
+	val = 0;
+	if (excit_buf_gain == 1)	/* EXCITBUFGAIN_0P25 */
+		val |= AD5940_HSDACCON_INAMPGNMDE;
+	if (hs_dac_gain == 1)		/* HSDACGAIN_0P2 */
+		val |= AD5940_HSDACCON_ATTENEN;
+	val |= (7 & 0xFF) << AD5940_HSDACCON_RATE_SHIFT;
+	ad5940_spi_write(priv, AD5940_REG_HSDACCON, val);
+
+	/* HSTIACON: HstiaBias=1P1(0) */
+	ad5940_spi_write(priv, AD5940_REG_HSTIACON, AD5940_HSTIABIAS_1P1);
+
+	/* HSRTIACON: Ctia=16 << 5 | RtiaSel=1, no DiodeClose */
+	val = (ctia_val << AD5940_HSRTIACON_CTIACON_SHIFT) | rtia_sel;
+	ad5940_spi_write(priv, AD5940_REG_HSRTIACON, val);
+
+	/* DE0RESCON: DeRtia=TODE(10), DeRload=OPEN(5) */
+	/* __AD5940_SetDExRTIA(0, HSTIADERTIA_TODE, HSTIADERLOAD_OPEN) */
+	/* DeRtia >= HSTIADERTIA_1K: tempreg = (10-3+11)<<3 = 0x90 */
+	/* DeRload >= HSTIADERLOAD_OPEN: tempreg |= 5 */
+	ad5940_spi_write(priv, AD5940_REG_DE0RESCON, 0x95);
+
+	/* Switch matrix: D=RCAL0, P=RCAL0, N=RCAL1, T=RCAL1|TRTIA|AIN1 */
+	ad5940_spi_write(priv, AD5940_REG_DSWFULLCON, AD5940_SWD_RCAL0);
+	ad5940_spi_write(priv, AD5940_REG_PSWFULLCON, AD5940_SWP_RCAL0);
+	ad5940_spi_write(priv, AD5940_REG_NSWFULLCON, AD5940_SWN_RCAL1);
+	ad5940_spi_write(priv, AD5940_REG_TSWFULLCON,
+			 AD5940_SWT_RCAL1 | AD5940_SWT_TRTIA | AD5940_SWT_AIN1);
+	ad5940_spi_write(priv, AD5940_REG_SWCON, AD5940_SWCON_SWSOURCESEL);
+
+	/* WG: sine wave, GainCal+OffsetCal, freq/amplitude/offset/phase */
+	ad5940_spi_write(priv, AD5940_REG_WGFCW, freq_word);
+	ad5940_spi_write(priv, AD5940_REG_WGAMPLITUDE, wg_amp_word);
+	ad5940_spi_write(priv, AD5940_REG_WGOFFSET, 0);
+	ad5940_spi_write(priv, AD5940_REG_WGPHASE, 0);
+	/* WGCON: SIN(2) << TYPESEL | DACGAINCAL | DACOFFSETCAL */
+	val = (AD5940_WGTYPE_SIN << AD5940_WGCON_TYPESEL_SHIFT) |
+	      AD5940_WGCON_DACGAINCAL | AD5940_WGCON_DACOFFSETCAL;
+	ad5940_spi_write(priv, AD5940_REG_WGCON, val);
+
+	/* 2e: DSPCfgS - Configure DSP */
+	/* ADCBaseCfgS: MuxP=P_NODE, MuxN=N_NODE, PGA=1.5 */
+	ad5940_spi_write(priv, AD5940_REG_ADCCON,
+			 AD5940_ADCMUXP_P_NODE |
+			 (AD5940_ADCMUXN_N_NODE << AD5940_ADCCON_MUXSELN_SHIFT) |
+			 (AD5940_ADCPGA_1P5 << AD5940_ADCCON_GNPGA_SHIFT));
+
+	/* ADCFilterCfgS: RMW ADCFILTERCON, keep AVRGEN only */
+	ret = ad5940_spi_read32(priv, AD5940_REG_ADCFILTERCON, &val);
+	if (ret)
+		return ret;
+	val &= AD5940_ADCFILTERCON_AVRGEN;
+	val |= AD5940_ADCRATE_800KHZ;
+	val |= (AD5940_ADCSINC2OSR_22 << AD5940_ADCFILTERCON_SINC2OSR_SHIFT);
+	val |= (AD5940_ADCSINC3OSR_2 << AD5940_ADCFILTERCON_SINC3OSR_SHIFT);
+	val |= (AD5940_ADCAVGNUM_16 << AD5940_ADCFILTERCON_AVRGNUM_SHIFT);
+	val |= AD5940_ADCFILTERCON_LPFBYPEN; /* BpNotch=bTRUE */
+	ad5940_spi_write(priv, AD5940_REG_ADCFILTERCON, val);
+
+	/* ADCFilterCfgS also enables SINC2NOTCH */
+	ret = rtia_cal_afe_ctrl(priv, AD5940_AFECTRL_SINC2NOTCH, true);
+	if (ret)
+		return ret;
+
+	/* ADCDigCompCfgS: all zeros (StructInit) */
+	ad5940_spi_write(priv, AD5940_REG_ADCMIN, 0);
+	ad5940_spi_write(priv, AD5940_REG_ADCMINSM, 0);
+	ad5940_spi_write(priv, AD5940_REG_ADCMAX, 0);
+	ad5940_spi_write(priv, AD5940_REG_ADCMAXSMEN, 0);
+
+	/* DFTCfgS: DftSrc=SINC3 → clear AVRGEN, set DFTINSEL; DftNum, HanWin */
+	ret = ad5940_spi_read32(priv, AD5940_REG_ADCFILTERCON, &val);
+	if (ret)
+		return ret;
+	val &= ~AD5940_ADCFILTERCON_AVRGEN;
+	ad5940_spi_write(priv, AD5940_REG_ADCFILTERCON, val);
+
+	/* DFTCON: HANNINGEN | DFTNUM(11)<<4 | DFTSRC(1)<<20 */
+	val = BIT(AD5940_DFTCON_HANNINGEN_SHIFT) | /* bit0 = 1: Hanning window */
+	      (AD5940_DFTNUM_8192 << AD5940_DFTCON_DFTNUM_SHIFT) |
+	      (AD5940_DFTSRC_SINC3 << AD5940_DFTCON_DFTINSEL_SHIFT);
+	ad5940_spi_write(priv, AD5940_REG_DFTCON, val);
+
+	/* StatisticCfgS: all zeros */
+	ad5940_spi_write(priv, AD5940_REG_STATSCON, 0);
+
+	/* 2f: Enable power modules (not WG/ADCCNV/DFT yet) */
+	/* AD5940_AFECtrlS(HSTIAPWR|INAMPPWR|EXTBUFPWR|DACREFPWR|HSDACPWR|SINC2NOTCH, bTRUE) */
+	ret = rtia_cal_afe_ctrl(priv,
+		AD5940_AFECTRL_HSTIAPWR | AD5940_AFECTRL_INAMPPWR |
+		AD5940_AFECTRL_EXTBUFPWR | AD5940_AFECTRL_DACREFPWR |
+		AD5940_AFECTRL_HSDACPWR | AD5940_AFECTRL_SINC2NOTCH,
+		true);
+	if (ret)
+		return ret;
+
+	/* ---- Sweep framework: single-frequency loop ---- */
+	/* For future multi-frequency calibration, expand this loop */
+	for (i = 0; i < 1; i++) {
+
+		/* ---- Phase 3: Measure V_Rcal ---- */
+		/* AD5940_AFECtrlS(WG|ADCPWR, bTRUE) */
+		ret = rtia_cal_afe_ctrl(priv,
+			AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR, true);
+		if (ret)
+			goto restore_intc;
+
+		/* AD5940_Delay10us(25) = 250us */
+		usleep_range(250, 300);
+
+		/* AD5940_AFECtrlS(ADCCNV|DFT, bTRUE) */
+		ret = rtia_cal_afe_ctrl(priv,
+			AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT, true);
+		if (ret)
+			goto restore_intc;
+
+		/* Wait for DFTRDY - DFT with 8192 points at ~82ms, allow 200ms */
+		ret = rtia_cal_wait_dft_ready(priv, 200);
+		if (ret) {
+			dev_err(dev, "RTIA cal: V_Rcal DFTRDY timeout\n");
+			goto restore_intc;
+		}
+
+		/* AD5940_AFECtrlS(ADCCNV|DFT|WG|ADCPWR, bFALSE) */
+		rtia_cal_afe_ctrl(priv,
+			AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT |
+			AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR, false);
+
+		/* AD5940_INTCClrFlag(AFEINTSRC_DFTRDY) */
+		ad5940_spi_write(priv, AD5940_REG_INTCCLR,
+				 AD5940_AFEINTSRC_DFTRDY);
+
+		/* Read DFT results */
+		{
+			u32 tmp_r, tmp_i;
+
+			ad5940_spi_read32(priv, AD5940_REG_DFTREAL, &tmp_r);
+			ad5940_spi_read32(priv, AD5940_REG_DFTIMAG, &tmp_i);
+			dft_rcal_real = (s32)tmp_r;
+			dft_rcal_imag = (s32)tmp_i;
+		}
+
+		/* ---- Phase 4: Measure V_Rtia ---- */
+		/* AD5940_ADCMuxCfgS(HSTIA_P, HSTIA_N) - RMW on ADCCON */
+		ret = rtia_cal_adc_mux_cfg(priv,
+			AD5940_ADCMUXP_HSTIA_P, AD5940_ADCMUXN_HSTIA_N);
+		if (ret)
+			goto restore_intc;
+
+		/* AD5940_AFECtrlS(WG|ADCPWR, bTRUE) */
+		ret = rtia_cal_afe_ctrl(priv,
+			AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR, true);
+		if (ret)
+			goto restore_intc;
+
+		/* AD5940_Delay10us(25) = 250us */
+		usleep_range(250, 300);
+
+		/* AD5940_AFECtrlS(ADCCNV|DFT, bTRUE) */
+		ret = rtia_cal_afe_ctrl(priv,
+			AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT, true);
+		if (ret)
+			goto restore_intc;
+
+		/* Wait for DFTRDY */
+		ret = rtia_cal_wait_dft_ready(priv, 200);
+		if (ret) {
+			dev_err(dev, "RTIA cal: V_Rtia DFTRDY timeout\n");
+			goto restore_intc;
+		}
+
+		/* AD5940_AFECtrlS(ADCCNV|DFT|WG|ADCPWR, bFALSE) */
+		rtia_cal_afe_ctrl(priv,
+			AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT |
+			AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR, false);
+
+		/* AD5940_INTCClrFlag(AFEINTSRC_DFTRDY) */
+		ad5940_spi_write(priv, AD5940_REG_INTCCLR,
+				 AD5940_AFEINTSRC_DFTRDY);
+
+		/* Read DFT results */
+		{
+			u32 tmp_r, tmp_i;
+
+			ad5940_spi_read32(priv, AD5940_REG_DFTREAL, &tmp_r);
+			ad5940_spi_read32(priv, AD5940_REG_DFTIMAG, &tmp_i);
+			dft_rtia_real = (s32)tmp_r;
+			dft_rtia_imag = (s32)tmp_i;
+		}
+
+		/* ---- Phase 5: Data post-processing ---- */
+		/* 18-bit sign extension: if bit17 set, set bits 31:18 */
+		if (dft_rcal_real & BIT(17))
+			dft_rcal_real |= 0xFFFC0000;
+		if (dft_rcal_imag & BIT(17))
+			dft_rcal_imag |= 0xFFFC0000;
+		if (dft_rtia_real & BIT(17))
+			dft_rtia_real |= 0xFFFC0000;
+		if (dft_rtia_imag & BIT(17))
+			dft_rtia_imag |= 0xFFFC0000;
+
+		/*
+		 * Negation matching ADI's HSRtiaCal lines 3591-3598:
+		 *   1) Negate both Real and Image of DftRtiaVolt
+		 *      (current direction correction for HSTIA_P-N measurement)
+		 *   2) Negate Image of both DftRtiaVolt and DftRcalVolt
+		 *      (DFT engine sign convention)
+		 *
+		 * Net effect:
+		 *   DftRtiaVolt.Real = -Real     (single negation)
+		 *   DftRtiaVolt.Image = Image    (double negation → unchanged)
+		 *   DftRcalVolt.Real = Real      (unchanged)
+		 *   DftRcalVolt.Image = -Image   (single negation)
+		 */
+		dft_rtia_imag = -dft_rtia_imag;
+		dft_rtia_real = -dft_rtia_real;
+		dft_rtia_imag = -dft_rtia_imag;
+		dft_rcal_imag = -dft_rcal_imag;
+
+		/* ---- Phase 6: Compute RTIA = (V_Rtia / V_Rcal) * Rcal ---- */
+		{
+			s64 denom, real_num, imag_num;
+			s64 rtia_real_mohm, rtia_imag_mohm;
+
+			denom = (s64)dft_rcal_real * dft_rcal_real +
+				(s64)dft_rcal_imag * dft_rcal_imag;
+			if (denom == 0) {
+				dev_err(dev, "RTIA cal: Rcal DFT denominator is zero\n");
+				ret = -EINVAL;
+				goto restore_intc;
+			}
+
+			/* Complex division: (a+bi)/(c+di) = ((ac+bd) + j(bc-ad)) / (c²+d²) */
+			real_num = (s64)dft_rtia_real * dft_rcal_real +
+				   (s64)dft_rtia_imag * dft_rcal_imag;
+			imag_num = (s64)dft_rtia_imag * dft_rcal_real -
+				   (s64)dft_rtia_real * dft_rcal_imag;
+
+			/* Multiply by Rcal (in ohms) * 1000 → milliohms */
+			rtia_real_mohm = div64_s64(real_num * (s64)rcal_ohm * 1000,
+						   denom);
+			rtia_imag_mohm = div64_s64(imag_num * (s64)rcal_ohm * 1000,
+						   denom);
+
+			priv->rtia_cal.real_mohm = rtia_real_mohm;
+			priv->rtia_cal.imag_mohm = rtia_imag_mohm;
+
+			/* Magnitude = sqrt(real² + imag²) in milliohms */
+			{
+				u64 r2, i2, sum_sq;
+
+				r2 = rtia_real_mohm < 0 ?
+					(u64)(-rtia_real_mohm) * (-rtia_real_mohm) :
+					(u64)rtia_real_mohm * rtia_real_mohm;
+				i2 = rtia_imag_mohm < 0 ?
+					(u64)(-rtia_imag_mohm) * (-rtia_imag_mohm) :
+					(u64)rtia_imag_mohm * rtia_imag_mohm;
+				sum_sq = r2 + i2;
+				priv->rtia_cal.magnitude_mohm = int_sqrt64(sum_sq);
+			}
+
+			/* Phase = atan2(imag, real) in millidegrees */
+			priv->rtia_cal.phase_mdeg =
+				rtia_cal_atan2_mdeg(rtia_imag_mohm, rtia_real_mohm);
+
+			dev_info(dev,
+				 "RTIA cal result: Mag=%lld.%03lld Ohm, Phase=%d.%03d deg, "
+				 "Real=%lld.%03lld Ohm, Imag=%lld.%03lld Ohm\n",
+				 div_s64(priv->rtia_cal.magnitude_mohm, 1000),
+				 priv->rtia_cal.magnitude_mohm >= 0 ?
+					priv->rtia_cal.magnitude_mohm % 1000 :
+					-priv->rtia_cal.magnitude_mohm % 1000,
+				 priv->rtia_cal.phase_mdeg / 1000,
+				 priv->rtia_cal.phase_mdeg >= 0 ?
+					priv->rtia_cal.phase_mdeg % 1000 :
+					-priv->rtia_cal.phase_mdeg % 1000,
+				 div_s64(priv->rtia_cal.real_mohm, 1000),
+				 priv->rtia_cal.real_mohm >= 0 ?
+					priv->rtia_cal.real_mohm % 1000 :
+					-priv->rtia_cal.real_mohm % 1000,
+				 div_s64(priv->rtia_cal.imag_mohm, 1000),
+				 priv->rtia_cal.imag_mohm >= 0 ?
+					priv->rtia_cal.imag_mohm % 1000 :
+					-priv->rtia_cal.imag_mohm % 1000);
+		}
+
+		/* TODO: For sweep calibration, update frequency here:
+		 *   AD5940_SweepNext(&AppBIACfg.SweepCfg, &hsrtia_cal.fFreq);
+		 *   AD5940_WGFreqWordCal(freq, sysclk) → write WGFCW
+		 */
+	}
+
+restore_intc:
+	/* Restore INTC1 DFTRDY configuration */
+	if (!(intc1_saved & AD5940_AFEINTSRC_DFTRDY)) {
+		/* DFTRDY was not previously enabled, disable it */
+		u32 intc1_cur;
+
+		if (ad5940_spi_read32(priv, AD5940_REG_INTCSEL1,
+					&intc1_cur) == 0)
+			ad5940_spi_write(priv, AD5940_REG_INTCSEL1,
+					 intc1_cur & ~AD5940_AFEINTSRC_DFTRDY);
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad5940_bia_rtia_cal);
+
 /* ------------------------------------------------------------------ */
 /*  BIA (Body Impedance) measurement setup                            */
 /*                                                                     */
@@ -887,7 +1519,7 @@ static int ad5940_bia_gen_measure_seq(struct ad5940_priv *priv,
  *   AppBIAInit():
  *     9.  WakeUp AFE
  *     10. SEQCfg(SeqMemSize=2KB, SeqEnable=FALSE, SeqCntCRCClr=TRUE)
- *     11. (RTIA calibration skipped - needs MCU interaction)
+ *     11. RTIA calibration (AppBIARtiaCal → AD5940_HSRtiaCal)
  *     12. FIFOCtrlS(DFT, FALSE)
  *     13. FIFOCfg(enable, FIFO, 4KB, DFT, thresh=4)
  *     14. INTCClrFlag(ALLINT)
@@ -1176,12 +1808,20 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 	ad5940_spi_write(priv, AD5940_REG_SEQCON, 0);
 	ad5940_spi_write(priv, AD5940_REG_FIFOCON, fifocon_saved);
 
-	/* ---- AppBIAInit Step 3: RTIA calibration (SKIPPED) ---- */
+	/* ---- AppBIAInit Step 3: RTIA calibration ---- */
 	/*
-	 * ADI does AppBIARtiaCal() here, which requires MCU-driven
-	 * measurement and data processing. We skip this and rely on
-	 * default RTIA value from the register table.
+	 * ADI does AppBIARtiaCal() → AD5940_HSRtiaCal() here.
+	 * This performs a single-frequency (50kHz) calibration of the
+	 * HSTIA RTIA resistor by measuring voltages across RCAL and RTIA,
+	 * then computing Rtia = (V_Rtia / V_Rcal) * Rcal.
+	 * The result is stored in priv->rtia_cal for use in impedance
+	 * calculation.
 	 */
+	ret = ad5940_bia_rtia_cal(priv);
+	if (ret) {
+		dev_err(dev, "BIA: RTIA calibration failed: %d\n", ret);
+		return ret;
+	}
 
 	/* ---- AppBIAInit Step 4: AD5940_FIFOCtrlS(DFT, FALSE) ---- */
 	/*
