@@ -281,7 +281,7 @@ static AD5940Err AppBIASeqCfgGen(void)
   return AD5940ERR_OK;
 }
 
-static AD5940Err AppBIASeqMeasureGen(void)
+static AD5940Err  AppBIASeqMeasureGen(void)
 {
   AD5940Err error = AD5940ERR_OK;
   uint32_t const *pSeqCmd;

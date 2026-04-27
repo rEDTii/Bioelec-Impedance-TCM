@@ -128,7 +128,7 @@ static const struct iio_chan_spec ad5940_dft_channels[] = {
 			.shift		= 0,
 			.endianness	= IIO_CPU,
 		},
-	},
+	}, 
 	[AD5940_DFT_TIMESTAMP] = IIO_CHAN_SOFT_TIMESTAMP(AD5940_DFT_TIMESTAMP),
 };
 
@@ -166,6 +166,7 @@ static int ad5940_trigger_reenable(struct iio_trigger *trig)
 {
 	struct ad5940_priv *priv = iio_trigger_get_drvdata(trig);
 
+	priv->irq_disabled = false;
 	enable_irq(priv->irq);
 	return 0;
 }
@@ -183,8 +184,12 @@ static const struct iio_trigger_ops ad5940_trigger_ops = {
  * ad5940_trigger_handler - Read FIFO DFT data and push to IIO buffer
  *
  * Called from the IIO trigger poll thread after GPIO interrupt.
- * Reads 4 FIFO words (current real/imag + voltage real/imag) and
- * pushes them into the IIO buffer with a timestamp.
+ * Reads all available DFT frames from FIFO (aligned to 4-word boundaries,
+ * matching ADI's FifoCnt = (FIFOGetCnt()/4)*4 pattern) and pushes each
+ * frame into the IIO buffer with a timestamp.
+ *
+ * Also implements ADI's STOPSYNC pattern: if stop_required is set,
+ * disables WUPT after safely reading FIFO data (AppBIARegModify).
  *
  * The FIFO source is FIFOSRC_DFT. Each DFT result consists of
  * a real and imaginary part, both 18-bit signed in a 32-bit word.
@@ -202,11 +207,9 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	 * so we must reserve space for it to avoid stack overflow.
 	 */
 	u32 buf[AD5940_DFT_CHANNELS + sizeof(s64) / sizeof(u32)];
-	// u32 raw16[16];  /* for reading all 16 FIFO words when threshold=16 */
-	int ret, fifo_cnt;
+	int ret, fifo_cnt, read_cnt, frames, frame;
 
 	memset(buf, 0, sizeof(buf));
-	// memset(raw16, 0, sizeof(raw16));
 
 	/* Wake up AFE (it may be in hibernate between measurements) */
 	ret = ad5940_wakeup(priv);
@@ -221,86 +224,169 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	 */
 	ad5940_spi_write(priv, AD5940_REG_SEQSLPLOCK, AD5940_SLPKEY_LOCK);
 
-	/* ---- Debug: read key registers after measurement cycle ---- */
-	{
-		static int dbg_cnt;
-		int adccon, dsw, psw, nsw, tsw, swcon;
+	// /* ---- Debug: verify clock, WUPT, sequencer & AFE state ---- */
+	// {
+	// 	static int clk_dbg_cnt;
+	// 	static ktime_t last_ts;
+	// 	ktime_t now = ktime_get();
+	// 	s64 dt_us = last_ts ? ktime_us_delta(now, last_ts) : 0;
 
-		if (dbg_cnt < 16) {
-			adccon = ad5940_spi_read(priv, AD5940_REG_ADCCON);
-			dsw = ad5940_spi_read(priv, AD5940_REG_DSWFULLCON);
-			psw = ad5940_spi_read(priv, AD5940_REG_PSWFULLCON);
-			nsw = ad5940_spi_read(priv, AD5940_REG_NSWFULLCON);
-			tsw = ad5940_spi_read(priv, AD5940_REG_TSWFULLCON);
-			swcon = ad5940_spi_read(priv, AD5940_REG_SWCON);
-			dev_info(&priv->spi->dev,
-				 "DBG[%d] ADCCON=0x%x MUXP=%d MUXN=%d PGA=%d | "
-				 "SW D=0x%x P=0x%x N=0x%x T=0x%x SWCON=0x%x\n",
-				 dbg_cnt, adccon,
-				 adccon & 0x3F, (adccon >> 8) & 0x1F,
-				 (adccon >> 16) & 0x7,
-				 dsw, psw, nsw, tsw, swcon);
-			dbg_cnt++;
-		}
-	}
+	// 	if (clk_dbg_cnt < 30) {
+	// 		int osccon, hposccon, clkcon0, clksel;
+	// 		int wuptcon, tmrcon;
+	// 		int seq0wupl, seq0wuph, seq0sleepl, seq0sleeph;
+	// 		u32 wakeup_time, sleep_time, wupt_period;
+	// 		u32 sysclk_div, adcclk_div, sysclk_src, adcclk_src;
+	// 		bool hfosc_16mhz;
+	// 		int afecon, seqcon, seqcnt, seq0info;
+	// 		int intcflag0, intcflag1;
 
-	/* Read FIFO count to check how many words are available */
+	// 		/* Clock & WUPT registers */
+	// 		osccon   = ad5940_spi_read(priv, AD5940_REG_ALLON_OSCCON);
+	// 		hposccon = ad5940_spi_read(priv, AD5940_REG_HPOSCCON);
+	// 		clkcon0  = ad5940_spi_read(priv, AD5940_REG_CLKCON0);
+	// 		clksel   = ad5940_spi_read(priv, AD5940_REG_CLKSEL);
+	// 		wuptcon  = ad5940_spi_read(priv, AD5940_REG_WUPTCON);
+	// 		tmrcon   = ad5940_spi_read(priv, AD5940_REG_ALLON_TMRCON);
+	// 		seq0wupl  = ad5940_spi_read(priv, AD5940_REG_WUPTSEQ0WUPL);
+	// 		seq0wuph  = ad5940_spi_read(priv, AD5940_REG_WUPTSEQ0WUPH);
+	// 		seq0sleepl = ad5940_spi_read(priv, AD5940_REG_WUPTSEQ0SLEEPL);
+	// 		seq0sleeph = ad5940_spi_read(priv, AD5940_REG_WUPTSEQ0SLEEPH);
+
+	// 		/* Sequencer & AFE state */
+	// 		afecon   = ad5940_spi_read(priv, AD5940_REG_AFECON);
+	// 		seqcon   = ad5940_spi_read(priv, AD5940_REG_SEQCON);
+	// 		seqcnt   = ad5940_spi_read(priv, AD5940_REG_SEQCNT);
+	// 		seq0info = ad5940_spi_read(priv, AD5940_REG_SEQ0INFO);
+	// 		intcflag0 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG0);
+	// 		intcflag1 = ad5940_spi_read(priv, AD5940_REG_INTCFLAG1);
+
+	// 		/* Decode clock config */
+	// 		sysclk_div  = (clkcon0 >> AD5940_CLKCON0_SYSCLKDIV_SHIFT) & 0x3F;
+	// 		adcclk_div  = (clkcon0 >> AD5940_CLKCON0_ADCCLKDIV_SHIFT) & 0xF;
+	// 		sysclk_src  = (clksel >> AD5940_CLKSEL_SYSCLKSEL_SHIFT) & 0x3;
+	// 		adcclk_src  = (clksel >> AD5940_CLKSEL_ADCCLKSEL_SHIFT) & 0x3;
+	// 		hfosc_16mhz = !!(hposccon & AD5940_HPOSCCON_CLK32MHZEN);
+
+	// 		/* Decode WUPT timing */
+	// 		wakeup_time = (u32)seq0wupl | ((u32)seq0wuph << 16);
+	// 		sleep_time  = (u32)seq0sleepl | ((u32)seq0sleeph << 16);
+	// 		wupt_period = (wakeup_time + 1) + (sleep_time + 1);
+
+	// 		/* Decode AFECON */
+	// 		dev_info(&priv->spi->dev,
+	// 			 "CLK[%d] dt=%lldus | OSCCON=0x%x HFOSC=%s LFOSC=%s | "
+	// 			 "HPOSCCON=0x%x(%s) CLKCON0=0x%x SysDiv=%u AdcDiv=%u | "
+	// 			 "CLKSEL=0x%x SysSrc=%u AdcSrc=%u\n",
+	// 			 clk_dbg_cnt, dt_us,
+	// 			 osccon,
+	// 			 (osccon & AD5940_OSCCON_HFOSCOK) ? "OK" : "NOT_RDY",
+	// 			 (osccon & AD5940_OSCCON_LFOSCOK) ? "OK" : "NOT_RDY",
+	// 			 hposccon, hfosc_16mhz ? "16MHz" : "32MHz",
+	// 			 clkcon0, sysclk_div, adcclk_div,
+	// 			 clksel, sysclk_src, adcclk_src);
+
+	// 		dev_info(&priv->spi->dev,
+	// 			 "  WUPT: CON=0x%x EN=%d ENDSEQ=%u CLKSEL=%u | "
+	// 			 "TMRCON=0x%x TMRINTEN=%d | "
+	// 			 "WkpT=%u SlpT=%u Period=%u => ODR=%uHz\n",
+	// 			 wuptcon, wuptcon & 1,
+	// 			 (wuptcon >> 1) & 0x7, (wuptcon >> 4) & 0x3,
+	// 			 tmrcon, tmrcon & 1,
+	// 			 wakeup_time, sleep_time, wupt_period,
+	// 			 wupt_period ? AD5940_BIA_WUPT_CLK_FREQ / wupt_period : 0);
+
+	// 		dev_info(&priv->spi->dev,
+	// 			 "  SEQ: CON=0x%x EN=%d HALT=%d | CNT=%u | "
+	// 			 "SEQ0INFO=0x%x Addr=%u Len=%u\n",
+	// 			 seqcon, seqcon & 1, (seqcon >> 1) & 1,
+	// 			 seqcnt & 0xFFFF,
+	// 			 seq0info, seq0info & 0xFFFF, (seq0info >> 16) & 0xFFFF);
+
+	// 		dev_info(&priv->spi->dev,
+	// 			 "  AFE: AFECON=0x%x WG=%d ADCPWR=%d ADCCNV=%d DFT=%d "
+	// 			 "SINC2NOTCH=%d HPREFDIS=%d | "
+	// 			 "INTC0=0x%x INTC1=0x%x\n",
+	// 			 afecon,
+	// 			 !!(afecon & AD5940_AFECON_WG),
+	// 			 !!(afecon & AD5940_AFECON_ADCPWR),
+	// 			 !!(afecon & AD5940_AFECON_ADCCNV),
+	// 			 !!(afecon & AD5940_AFECON_DFT),
+	// 			 !!(afecon & AD5940_AFECON_SINC2NOTCH),
+	// 			 !!(afecon & AD5940_AFECON_HPREFDIS),
+	// 			 intcflag0, intcflag1);
+
+	// 		last_ts = now;
+	// 		clk_dbg_cnt++;
+	// 	}
+	// }
+
+	/* Read FIFO count: FIFOCNTSTA.DATAFIFOCNTSTA is bits[26:16] (11-bit field) */
 	ret = ad5940_spi_read(priv, AD5940_REG_FIFOCNT);
 	if (ret < 0) {
 		dev_err(&priv->spi->dev, "FIFO count read failed: %d\n",
 			ret);
 		goto out;
 	}
-	/* FIFOCNTSTA.DATAFIFOCNTSTA is in bits[26:16], per AD5940 datasheet */
-	fifo_cnt = ret >> 16;
+	fifo_cnt = (ret >> 16) & 0x7FF;  /* Mask 11-bit DATAFIFOCNTSTA field */
 
-	/* DEBUG: print FIFOCNT raw value and extracted count */
-	{
-		static int _dbg_cnt;
-		if (_dbg_cnt < 16) {
-			dev_info(&priv->spi->dev,
-				 "FIFO: raw=0x%x cnt=%d\n",
-				 ret, fifo_cnt);
-			_dbg_cnt++;
-		}
+	/*
+	 * Align to 4-word frames (ADI: FifoCnt = (FIFOGetCnt()/4)*4).
+	 * This ensures we always read complete DFT frames and leaves
+	 * any partial frame for the next interrupt.
+	 */
+	read_cnt = (fifo_cnt / AD5940_DFT_CHANNELS) * AD5940_DFT_CHANNELS;
+
+	// /* DEBUG: print FIFOCNT raw value and extracted count */
+	// {
+	// 	static int _dbg_cnt;
+	// 	if (_dbg_cnt < 16) {
+	// 		dev_info(&priv->spi->dev,
+	// 			 "FIFO: raw=0x%x cnt=%d read_cnt=%d\n",
+	// 			 ret, fifo_cnt, read_cnt);
+	// 		_dbg_cnt++;
+	// 	}
+	// }
+
+	if (read_cnt == 0) {
+		dev_warn(&priv->spi->dev,
+			 "FIFO underrun: %d words (no complete frame)\n",
+			 fifo_cnt);
+		goto out_clear;
 	}
 
 	/*
-	 * Read exactly one DFT frame (4 words).
-	 *
-	 * TODO: Handle fifo_cnt > 4 (multiple measurement cycles in FIFO).
-	 * For now, if there are more than 4 words, we read 4 and the
-	 * remaining words will be picked up on the next interrupt.
-	 * If fifo_cnt < 4, something is wrong — read what's available.
+	 * Read all available frames from FIFO and push each one
+	 * to the IIO buffer separately (with its own timestamp).
+	 * ADI reads all frames in one FIFORd call then processes;
+	 * we read frame-by-frame since IIO needs per-frame timestamps.
 	 */
-	if (fifo_cnt < AD5940_DFT_CHANNELS) {
-		dev_warn(&priv->spi->dev,
-			 "FIFO underrun: %d words (expected %d)\n",
-			 fifo_cnt, AD5940_DFT_CHANNELS);
-		if (fifo_cnt == 0)
-			goto out;
-	}
-
-	ret = ad5940_fifo_read(priv, buf,
-			       min(fifo_cnt, AD5940_DFT_CHANNELS));
-	if (ret) {
-		dev_err(&priv->spi->dev, "FIFO read failed: %d\n", ret);
-		goto out;
-	}
-
-	/* DEBUG: print raw FIFO words */
-	{
-		static int _raw_cnt;
-		if (_raw_cnt < 16) {
-			dev_info(&priv->spi->dev,
-					"RAW1: %08x %08x %08x %08x\n",
-					buf[0], buf[1], buf[2], buf[3]);
-			_raw_cnt++;
+	frames = read_cnt / AD5940_DFT_CHANNELS;
+	for (frame = 0; frame < frames; frame++) {
+		ret = ad5940_fifo_read(priv, buf, AD5940_DFT_CHANNELS);
+		if (ret) {
+			dev_err(&priv->spi->dev,
+				"FIFO read failed at frame %d/%d: %d\n",
+				frame, frames, ret);
+			goto out_clear;
 		}
+
+		// /* DEBUG: print raw FIFO words (first 2 frames only) */
+		// if (frame < 2) {
+		// 	static int _raw_cnt;
+		// 	if (_raw_cnt < 16) {
+		// 		dev_info(&priv->spi->dev,
+		// 			 "RAW[%d]: %08x %08x %08x %08x\n",
+		// 			 frame, buf[0], buf[1], buf[2], buf[3]);
+		// 		_raw_cnt++;
+		// 	}
+		// }
+
+		iio_push_to_buffers_with_timestamp(indio_dev, buf,
+						   iio_get_time_ns(indio_dev));
 	}
 
-
-
+out_clear:
 	/* Clear FIFO threshold interrupt flag in AD5940 INTC */
 	ad5940_spi_write(priv, AD5940_REG_INTCCLR,
 			 AD5940_AFEINTSRC_DATAFIFOTHRESH);
@@ -308,11 +394,6 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	/* Unlock sleep key (allow AFE to hibernate after next measurement) */
 	ad5940_spi_write(priv, AD5940_REG_SEQSLPLOCK,
 			 AD5940_SLPKEY_UNLOCK);
-
-	/* Push data to IIO buffer (only if we have a full frame) */
-	if (fifo_cnt >= AD5940_DFT_CHANNELS)
-		iio_push_to_buffers_with_timestamp(indio_dev, buf,
-						   iio_get_time_ns(indio_dev));
 
 out:
 	iio_trigger_notify_done(indio_dev->trig);
@@ -346,14 +427,15 @@ static irqreturn_t ad5940_irq_handler(int irq, void *dev_id)
 	struct iio_dev *indio_dev = dev_id;
 	struct ad5940_priv *priv = iio_priv(indio_dev);
 
-
-	// dev_info(&priv->spi->dev, "Enter ad5940_irq_handler\n");
-
 	/*
 	 * Disable IRQ to prevent re-entry until the trigger handler
 	 * finishes and calls iio_trigger_notify_done() → reenable().
+	 * Track the disabled state so ad5940_bia_stop() can re-enable
+	 * the IRQ if the trigger handler never runs (e.g., buffer
+	 * disabled between interrupt and handler execution).
 	 */
 	disable_irq_nosync(priv->irq);
+	priv->irq_disabled = true;
 
 	iio_trigger_poll(priv->trig);
 

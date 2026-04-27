@@ -289,6 +289,573 @@ int ad5940_seq_cmd_write(struct ad5940_priv *priv,
 }
 EXPORT_SYMBOL_GPL(ad5940_seq_cmd_write);
 
+/* ================================================================== */
+/*  ADI-style sequence generator for BIA measure sequence             */
+/*                                                                     */
+/*  This replicates the EXACT flow of ADI's AppBIASeqMeasureGen()     */
+/*  which uses high-level API functions (AFECtrlS, ADCMuxCfgS,        */
+/*  SWMatrixCfgS, SEQGpioCtrlS, EnterSleepS) that internally do       */
+/*  read-modify-write on AFECON/ADCCON registers.                     */
+/*                                                                     */
+/*  The key insight: ADI's sequence generator intercepts WriteReg()   */
+/*  to generate SEQ_WR() commands instead of SPI writes. AFECtrlS()   */
+/*  does ReadReg(AFECON)→modify→WriteReg(AFECON), tracking state.    */
+/*  We replicate this with shadow registers.                          */
+/* ================================================================== */
+
+/*
+ * seq_shadow_regs - Shadow register state persisted across sequence generation
+ *
+ * ADI's SEQGen uses a static global SeqGenDB whose RegInfo array persists
+ * between AppBIASeqCfgGen() and AppBIASeqMeasureGen() calls. We replicate
+ * this by extracting shadow registers into a separate struct that can be
+ * passed from init sequence generation to measure sequence generation.
+ *
+ * @shadow_afecon:      Shadow of AFECON register (tracked by AFECtrlS)
+ * @shadow_adccon:      Shadow of ADCCON register (tracked by ADCMuxCfgS)
+ * @shadow_bufsencon:   Shadow of BUFSENCON register (tracked by REFCfgS)
+ * @shadow_adcfiltcon:  Shadow of ADCFILTERCON register (tracked by ADCFilterCfgS/DFTCfgS)
+ */
+struct seq_shadow_regs {
+	u32	shadow_afecon;
+	u32	shadow_adccon;
+	u32	shadow_bufsencon;
+	u32	shadow_adcfiltcon;
+};
+
+/*
+ * seq_gen_buf - Sequence generator buffer and state
+ *
+ * @cmd:       Buffer for generated SEQ_WR/SEQ_WAIT commands
+ * @len:       Number of commands generated so far
+ * @max_len:   Buffer capacity
+ * @shadow:    Shadow register state (shared across init/measure generation)
+ */
+struct seq_gen_buf {
+	u32			*cmd;
+	int			len;
+	int			max_len;
+	struct seq_shadow_regs	shadow;
+};
+
+/* Emit a single sequencer command into the buffer */
+static void seq_emit(struct seq_gen_buf *sg, u32 command)
+{
+	if (sg->len < sg->max_len)
+		sg->cmd[sg->len++] = command;
+}
+
+/* ---- Equivalent of AD5940_SEQGenInsert(SEQ_WAIT(clks)) ---- */
+static void seq_wait(struct seq_gen_buf *sg, u32 clks)
+{
+	seq_emit(sg, SEQ_WAIT(clks));
+}
+
+/* ---- Equivalent of AD5940_WriteReg() when engine is running ---- */
+static void seq_write_reg(struct seq_gen_buf *sg, u16 addr, u32 data)
+{
+	if (addr > 0x21ff) {
+		/* Address out of sequencer range - skip */
+		return;
+	}
+	seq_emit(sg, SEQ_WR(addr, data));
+}
+
+/*
+ * seq_afe_ctrl - Equivalent of AD5940_AFECtrlS(AfeCtrlSet, State)
+ *
+ * ADI's AFECtrlS() has special handling for inverted bits:
+ *   AFECTRL_HPREFPWR (bit5): enable → clear HPREFDIS, disable → set HPREFDIS
+ *   AFECTRL_ALDOLIMIT (bit19): enable → clear ALDOILIMITEN, disable → set ALDOILIMITEN
+ *
+ * All other bits: enable → set, disable → clear
+ *
+ * Then generate SEQ_WR(AFECON, new_shadow_value)
+ */
+static void seq_afe_ctrl(struct seq_gen_buf *sg, u32 ctrl_set, bool enable)
+{
+	u32 special = ctrl_set;
+
+	if (enable) {
+		/* Inverted bits: enable means CLEAR the disable bit */
+		if (ctrl_set & AD5940_AFECTRL_HPREFPWR) {
+			sg->shadow.shadow_afecon &= ~AD5940_AFECON_HPREFDIS;
+			special &= ~AD5940_AFECTRL_HPREFPWR;
+		}
+		if (ctrl_set & AD5940_AFECTRL_ALDOLIMIT) {
+			sg->shadow.shadow_afecon &= ~AD5940_AFECON_ALDOILIMITEN;
+			special &= ~AD5940_AFECTRL_ALDOLIMIT;
+		}
+		sg->shadow.shadow_afecon |= special;
+	} else {
+		/* Inverted bits: disable means SET the disable bit */
+		if (ctrl_set & AD5940_AFECTRL_HPREFPWR) {
+			sg->shadow.shadow_afecon |= AD5940_AFECON_HPREFDIS;
+			special &= ~AD5940_AFECTRL_HPREFPWR;
+		}
+		if (ctrl_set & AD5940_AFECTRL_ALDOLIMIT) {
+			sg->shadow.shadow_afecon |= AD5940_AFECON_ALDOILIMITEN;
+			special &= ~AD5940_AFECTRL_ALDOLIMIT;
+		}
+		sg->shadow.shadow_afecon &= ~special;
+	}
+
+	seq_write_reg(sg, AD5940_REG_AFECON, sg->shadow.shadow_afecon);
+}
+
+/*
+ * seq_adc_mux_cfg - Equivalent of AD5940_ADCMuxCfgS(MuxP, MuxN)
+ *
+ * Clear MUXSELP and MUXSELN fields, then set new values.
+ * Generate SEQ_WR(ADCCON, new_shadow_value)
+ */
+static void seq_adc_mux_cfg(struct seq_gen_buf *sg, u32 muxp, u32 muxn)
+{
+	sg->shadow.shadow_adccon &= ~(AD5940_ADCCON_MUXSELP_MASK |
+			       AD5940_ADCCON_MUXSELN_MASK);
+	sg->shadow.shadow_adccon |= (muxp << AD5940_ADCCON_MUXSELP_SHIFT);
+	sg->shadow.shadow_adccon |= (muxn << AD5940_ADCCON_MUXSELN_SHIFT);
+
+	seq_write_reg(sg, AD5940_REG_ADCCON, sg->shadow.shadow_adccon);
+}
+
+/*
+ * seq_sw_matrix_cfg - Equivalent of AD5940_SWMatrixCfgS(&sw_cfg)
+ *
+ * Write DSWFULLCON, PSWFULLCON, NSWFULLCON, TSWFULLCON, SWCON(commit)
+ */
+static void seq_sw_matrix_cfg(struct seq_gen_buf *sg,
+			       u32 dsw, u32 psw, u32 nsw, u32 tsw)
+{
+	seq_write_reg(sg, AD5940_REG_DSWFULLCON, dsw);
+	seq_write_reg(sg, AD5940_REG_PSWFULLCON, psw);
+	seq_write_reg(sg, AD5940_REG_NSWFULLCON, nsw);
+	seq_write_reg(sg, AD5940_REG_TSWFULLCON, tsw);
+	seq_write_reg(sg, AD5940_REG_SWCON, AD5940_SWCON_SWSOURCESEL);
+}
+
+/*
+ * seq_gpio_ctrl - Equivalent of AD5940_SEQGpioCtrlS(Gpio)
+ *
+ * Writes SYNCEXTDEVICE register via sequencer.
+ */
+static void seq_gpio_ctrl(struct seq_gen_buf *sg, u32 gpio)
+{
+	seq_write_reg(sg, AD5940_REG_SYNCEXTDEVICE, gpio);
+}
+
+/*
+ * seq_enter_sleep - Equivalent of AD5940_EnterSleepS()
+ *
+ * Write SEQTRGSLP=0 then SEQTRGSLP=1 (trigger hibernate)
+ */
+static void seq_enter_sleep(struct seq_gen_buf *sg)
+{
+	seq_write_reg(sg, AD5940_REG_SEQTRGSLP, 0x00);
+	seq_write_reg(sg, AD5940_REG_SEQTRGSLP, 0x01);
+}
+
+/* ================================================================== */
+/*  BIA Init sequence generator                                        */
+/*                                                                     */
+/*  Faithfully replicates ADI's AppBIASeqCfgGen() which generates      */
+/*  SEQ_WR commands for all init register writes. The sequence is      */
+/*  executed by the AD5940 sequencer (SEQID_1), matching ADI's flow.   */
+/*                                                                     */
+/*  Call order (from BodyImpedance.c AppBIASeqCfgGen):                 */
+/*    1. REFCfgS  → AFECON(RMW), BUFSENCON, LPREFBUFCON               */
+/*    2. HSLoopCfgS → HSDacCfgS, HSTIACfgS, SWMatrixCfgS, WGCfgS      */
+/*    3. LPLoopCfgS → LPDACCfgS, LPAMPCfgS                            */
+/*    4. DSPCfgS  → ADCBaseCfgS, ADCFilterCfgS+AFECtrlS,              */
+/*                   ADCDigCompCfgS, DFTCfgS, StatisticCfgS            */
+/*    5. AFECtrlS (enable modules)                                     */
+/*    6. SEQGpioCtrlS(0)                                              */
+/*    7. SEQ_STOP()                                                   */
+/* ================================================================== */
+
+/**
+ * ad5940_bia_gen_init_seq - Generate BIA init sequence (ADI AppBIASeqCfgGen flow)
+ * @priv: driver private data
+ * @buf:  output buffer for generated sequencer commands
+ * @buf_size: buffer capacity (in u32 words)
+ *
+ * Generates the init sequence that is executed once by SEQID_1.
+ * This configures all analog blocks (REF, HSLoop, LPLoop, DSP) and
+ * enables the AFE modules, exactly as ADI's AppBIASeqCfgGen() does.
+ *
+ * Return: number of commands generated, or negative errno on failure
+ */
+static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
+				   u32 *buf, int buf_size,
+				   struct seq_shadow_regs *shadow_out)
+{
+	struct seq_gen_buf sg;
+	int afecon_rd;
+
+	sg.cmd = buf;
+	sg.len = 0;
+	sg.max_len = buf_size;
+
+	/*
+	 * Initialize shadow registers from hardware, matching ADI's
+	 * sequence generator behavior where first ReadReg() reads
+	 * the actual hardware value.
+	 */
+	afecon_rd = ad5940_spi_read(priv, AD5940_REG_AFECON);
+	if (afecon_rd < 0)
+		return afecon_rd;
+	sg.shadow.shadow_afecon = (u32)afecon_rd;
+	sg.shadow.shadow_adccon = (u32)ad5940_spi_read(priv, AD5940_REG_ADCCON);
+	sg.shadow.shadow_bufsencon = (u32)ad5940_spi_read(priv, AD5940_REG_BUFSENCON);
+	sg.shadow.shadow_adcfiltcon = (u32)ad5940_spi_read(priv, AD5940_REG_ADCFILTERCON);
+
+	/* ================================================================
+	 * Step 1: AD5940_REFCfgS - HP/LP reference configuration
+	 * ================================================================ */
+
+	/* REFCfgS: AFECON - clear HPREFDIS to enable HP bandgap */
+	sg.shadow.shadow_afecon &= ~AD5940_AFECON_HPREFDIS;
+	seq_write_reg(&sg, AD5940_REG_AFECON, sg.shadow.shadow_afecon);
+
+	/* REFCfgS: BUFSENCON - read-modify-write, matching ADI's
+	 * AD5940_ReadReg(REG_AFE_BUFSENCON) then OR-set bits.
+	 * Hp1V8BuffEn=bTRUE  → V1P8HPADCEN
+	 * Hp1V1BuffEn=bTRUE  → V1P1HPADCEN
+	 * All other fields remain unchanged from hardware default.
+	 */
+	sg.shadow.shadow_bufsencon |= AD5940_BUFSENCON_V1P8HPADCEN;
+	sg.shadow.shadow_bufsencon |= AD5940_BUFSENCON_V1P1HPADCEN;
+	seq_write_reg(&sg, AD5940_REG_BUFSENCON, sg.shadow.shadow_bufsencon);
+
+	/* REFCfgS: LPREFBUFCON
+	 * LpBandgapEn=bTRUE → LPREFDIS=0 (clear bit)
+	 * LpRefBufEn=bTRUE  → LPBUF2P5DIS=0 (clear bit)
+	 * LpRefBoostEn=bFALSE → BOOSTCURRENT=0
+	 * All zero → LP bandgap ON, LP buf ON
+	 */
+	seq_write_reg(&sg, AD5940_REG_LPREFBUFCON, 0x00);
+
+	/* ================================================================
+	 * Step 2: AD5940_HSLoopCfgS
+	 * ================================================================ */
+
+	/* 2a: AD5940_HSDacCfgS - HSDACCON
+	 * ExcitBufGain=2, HsDacGain=1, HsDacUpdateRate=7
+	 * RATE=7<<1=0x0E, INAMPGNMDE=0, ATTENEN=0
+	 */
+	seq_write_reg(&sg, AD5940_REG_HSDACCON,
+		      7 << AD5940_HSDACCON_RATE_SHIFT);
+
+	/* 2b: AD5940_HSTIACfgS - HSTIACON, HSRTIACON, DE0RESCON
+	 * HstiaBias = HSTIABIAS_1P1 (=0), DiodeClose=0
+	 * HSTIACON = 0x00
+	 */
+	seq_write_reg(&sg, AD5940_REG_HSTIACON, 0x00);
+
+	/* HSRTIACON: Ctia=16<<5=0x200, RtiaSel=HSTIARTIA_1K=1 → 0x201 */
+	seq_write_reg(&sg, AD5940_REG_HSRTIACON,
+		      (16 << AD5940_HSRTIACON_CTIACON_SHIFT) |
+		      AD5940_HSTIARTIA_1K);
+
+	/* DE0RESCON: DeRtia=OPEN(0x1F<<3=0xF8), DeRload=OPEN(=5) → 0xFD */
+	seq_write_reg(&sg, AD5940_REG_DE0RESCON,
+		      (AD5940_HSTIADERTIA_OPEN << 3) |
+		      AD5940_HSTIADERLOAD_OPEN);
+
+	/* 2c: AD5940_SWMatrixCfgS - Init switches (PL/NL closed, D open)
+	 * D=SWD_OPEN=0, P=SWP_PL|SWP_PL2, N=SWN_NL|SWN_NL2, T=SWT_TRTIA
+	 */
+	seq_write_reg(&sg, AD5940_REG_DSWFULLCON, AD5940_SWD_OPEN);
+	seq_write_reg(&sg, AD5940_REG_PSWFULLCON,
+		      AD5940_SWP_PL | AD5940_SWP_PL2);
+	seq_write_reg(&sg, AD5940_REG_NSWFULLCON,
+		      AD5940_SWN_NL | AD5940_SWN_NL2);
+	seq_write_reg(&sg, AD5940_REG_TSWFULLCON, AD5940_SWT_TRTIA);
+	seq_write_reg(&sg, AD5940_REG_SWCON, AD5940_SWCON_SWSOURCESEL);
+
+	/* 2d: AD5940_WGCfgS - Waveform generator (SIN mode)
+	 * SinFreqWord = 0x33333 (50kHz @ 16MHz SysClk)
+	 * SinAmplitudeWord = 0x7FF (800mVpp)
+	 * SinPhaseWord = 0, SinOffsetWord = 0
+	 * WGCON: WGTYPE_SIN=2, GainCalEn=0, OffsetCalEn=0
+	 */
+	seq_write_reg(&sg, AD5940_REG_WGFCW, 0x33333);
+	seq_write_reg(&sg, AD5940_REG_WGAMPLITUDE, 0x7FF);
+	seq_write_reg(&sg, AD5940_REG_WGOFFSET, 0x00);
+	seq_write_reg(&sg, AD5940_REG_WGPHASE, 0x00);
+	seq_write_reg(&sg, AD5940_REG_WGCON,
+		      AD5940_WGTYPE_SIN << AD5940_WGCON_TYPESEL_SHIFT);
+
+	/* ================================================================
+	 * Step 3: AD5940_LPLoopCfgS
+	 * ================================================================ */
+
+	/* 3a: AD5940_LPDACCfgS - LPDACCON0, LPDACDAT0, LPDACSW0
+	 * LPDACCON0: Src=MMR, VzeroMux=6BIT, VbiasMux=12BIT, Ref=2P5,
+	 *            DataRst=FALSE(RSTEN=1), PowerEn=TRUE(PWDEN=0) → 0x01
+	 */
+	seq_write_reg(&sg, AD5940_REG_LPDACCON0, 0x01);
+
+	/* LPDACDAT0: DacData6Bit=31, DacData12Bit=1675(0x68B)
+	 * (1100-200)/2200.0*4095 = 1675.227 → 1675
+	 * → (31<<12)|0x68B = 0xF68B
+	 */
+	seq_write_reg(&sg, AD5940_REG_LPDACDAT0, 0xF68B);
+
+	/* LPDACSW0: VBIAS2LPPA|VBIAS2PIN|VZERO2LPTIA|VZERO2PIN|LPMODEDIS
+	 * = 0x10|0x08|0x04|0x02|0x20 = 0x3E
+	 */
+	seq_write_reg(&sg, AD5940_REG_LPDACSW0,
+		      AD5940_LPDACSW_VBIAS2LPPA | AD5940_LPDACSW_VBIAS2PIN |
+		      AD5940_LPDACSW_VZERO2LPTIA | AD5940_LPDACSW_VZERO2PIN |
+		      AD5940_LPDACSW_LPMODEDIS);
+
+	/* 3b: AD5940_LPAMPCfgS - LPTIACON0, LPTIASW0
+	 * LpTiaRf=LPTIARF_20K(=2), LpTiaRload=SHORT(=0), LpTiaRtia=OPEN(=0)
+	 * LPTIACON0: 2<<13=0x4000, PA/PWR/TIA bits
+	 */
+	seq_write_reg(&sg, AD5940_REG_LPTIACON0,
+		      AD5940_LPTIARF_20K << 13);
+
+	/* LPTIASW0: SW(5)|SW(6)|SW(7)|SW(8)|SW(9)|SW(12)|SW(13) = 0x33E0 */
+	seq_write_reg(&sg, AD5940_REG_LPTIASW0,
+		      AD5940_LPTIASW(5) | AD5940_LPTIASW(6) |
+		      AD5940_LPTIASW(7) | AD5940_LPTIASW(8) |
+		      AD5940_LPTIASW(9) | AD5940_LPTIASW(12) |
+		      AD5940_LPTIASW(13));
+
+	/* ================================================================
+	 * Step 4: AD5940_DSPCfgS
+	 * ================================================================ */
+
+	/* 4a: AD5940_ADCBaseCfgS - ADCCON
+	 * Matching ADI's ADCBaseCfgS: full-write from zero (not RMW).
+	 * ADCMuxP=ADCMUXP_HSTIA_P(=1), ADCMuxN=ADCMUXN_HSTIA_N(=1), ADCPga=0
+	 * tempreg = MuxP | (MuxN<<8) | (Pga<<16) = 0x1 | (0x1<<8) = 0x101
+	 */
+	sg.shadow.shadow_adccon =
+		(AD5940_ADCMUXP_HSTIA_P << AD5940_ADCCON_MUXSELP_SHIFT) |
+		(AD5940_ADCMUXN_HSTIA_N << AD5940_ADCCON_MUXSELN_SHIFT);
+	seq_write_reg(&sg, AD5940_REG_ADCCON, sg.shadow.shadow_adccon);
+
+	/* 4b: AD5940_ADCFilterCfgS - ADCFILTERCON
+	 * Matching ADI's RMW: ReadReg → keep AVRGEN → set new fields.
+	 * ADCRate=1(800kHz), Sinc3Osr=2, Sinc2Osr=22, AvgNum=16
+	 * BpNotch=bTRUE(LPFBYPEN=1), BpSinc3=FALSE, Sinc2NotchEnable=TRUE
+	 */
+	sg.shadow.shadow_adcfiltcon &= AD5940_ADCFILTERCON_AVRGEN;
+	sg.shadow.shadow_adcfiltcon |= AD5940_ADCRATE_800KHZ;
+	sg.shadow.shadow_adcfiltcon |=
+		(AD5940_ADCSINC3OSR_2 << AD5940_ADCFILTERCON_SINC3OSR_SHIFT) |
+		(AD5940_ADCSINC2OSR_22 << AD5940_ADCFILTERCON_SINC2OSR_SHIFT) |
+		(AD5940_ADCAVGNUM_16 << AD5940_ADCFILTERCON_AVRGNUM_SHIFT);
+	sg.shadow.shadow_adcfiltcon |= AD5940_ADCFILTERCON_LPFBYPEN; /* BpNotch=bTRUE */
+	seq_write_reg(&sg, AD5940_REG_ADCFILTERCON, sg.shadow.shadow_adcfiltcon);
+
+	/* ADCFilterCfgS calls AFECtrlS(SINC2NOTCH, bTRUE) → write AFECON */
+	seq_afe_ctrl(&sg, AD5940_AFECTRL_SINC2NOTCH, true);
+
+	/* 4c: AD5940_ADCDigCompCfgS - ADCMIN, ADCMINSM, ADCMAX, ADCMAXSMEN
+	 * memset to 0 in ADI's code → all zeros
+	 */
+	seq_write_reg(&sg, AD5940_REG_ADCMIN, 0x00);
+	seq_write_reg(&sg, AD5940_REG_ADCMINSM, 0x00);
+	seq_write_reg(&sg, AD5940_REG_ADCMAX, 0x00);
+	seq_write_reg(&sg, AD5940_REG_ADCMAXSMEN, 0x00);
+
+	/* 4d: AD5940_DFTCfgS - ADCFILTERCON (clear AVRGEN), DFTCON
+	 * Matching ADI's RMW: ReadReg → &= ~AVRGEN → WriteReg
+	 * DftSrc=DFTSRC_SINC3(≠AVG), so clear AVRGEN
+	 * DFTCON: HanWinEn=1, DftNum=8192(=11), DftSrc=SINC3(=1)
+	 * = BIT(0) | (11<<4) | (1<<20)
+	 */
+	sg.shadow.shadow_adcfiltcon &= ~AD5940_ADCFILTERCON_AVRGEN;
+	seq_write_reg(&sg, AD5940_REG_ADCFILTERCON, sg.shadow.shadow_adcfiltcon);
+
+	seq_write_reg(&sg, AD5940_REG_DFTCON,
+		      BIT(0) |  /* HANNINGEN */
+		      (AD5940_DFTNUM_8192 << AD5940_DFTCON_DFTNUM_SHIFT) |
+		      (AD5940_DFTSRC_SINC3 << AD5940_DFTCON_DFTINSEL_SHIFT));
+
+	/* 4e: AD5940_StatisticCfgS - STATSCON = 0 (disabled) */
+	seq_write_reg(&sg, AD5940_REG_STATSCON, 0x00);
+
+	/* ================================================================
+	 * Step 5: AD5940_AFECtrlS - Enable AFE modules
+	 *
+	 * ADI enables: HPREFPWR|HSTIAPWR|INAMPPWR|EXTBUFPWR|
+	 *              WG|DACREFPWR|HSDACPWR|SINC2NOTCH
+	 *
+	 * Note: SINC2NOTCH was already enabled in step 4b's AFECtrlS call,
+	 * but ADI's code explicitly includes it in this AFECtrlS call too.
+	 * The shadow_afecon already has SINC2NOTCH set from step 4b,
+	 * so setting it again is a no-op on the shadow but generates
+	 * an additional SEQ_WR(AFECON) - matching ADI exactly.
+	 * ================================================================ */
+	seq_afe_ctrl(&sg,
+		     AD5940_AFECTRL_HPREFPWR | AD5940_AFECTRL_HSTIAPWR |
+		     AD5940_AFECTRL_INAMPPWR | AD5940_AFECTRL_EXTBUFPWR |
+		     AD5940_AFECTRL_WG | AD5940_AFECTRL_DACREFPWR |
+		     AD5940_AFECTRL_HSDACPWR | AD5940_AFECTRL_SINC2NOTCH,
+		     true);
+
+	/* ================================================================
+	 * Step 6: AD5940_SEQGpioCtrlS(0) - No GPIO pins during init
+	 * ================================================================ */
+	seq_gpio_ctrl(&sg, 0);
+
+	/* ================================================================
+	 * Step 7: SEQ_STOP() - End of init sequence
+	 * ================================================================ */
+	seq_emit(&sg, SEQ_STOP());
+
+	/* Output final shadow register state for measure sequence generation */
+	if (shadow_out)
+		*shadow_out = sg.shadow;
+
+	return sg.len;
+}
+
+/**
+ * ad5940_bia_gen_measure_seq - Generate BIA measure sequence (ADI flow)
+ * @priv: driver private data
+ * @buf:  output buffer for generated sequencer commands
+ * @buf_size: buffer capacity (in u32 words)
+ * @shadow_in: shadow register state from init sequence generation
+ *
+ * Replicates the EXACT call order of ADI's AppBIASeqMeasureGen():
+ *
+ *   SEQGpioCtrlS(AGPIO_Pin6)
+ *   SEQGenInsert(SEQ_WAIT(16*250))
+ *   SWMatrixCfgS(D=CE0, P=CE0, N=AIN1, T=AIN1|TRTIA)
+ *   ADCMuxCfgS(HSTIA_P, HSTIA_N)
+ *   AFECtrlS(WG|ADCPWR, bTRUE)
+ *   SEQGenInsert(SEQ_WAIT(16*50))
+ *   AFECtrlS(ADCCNV|DFT, bTRUE)
+ *   SEQGenInsert(SEQ_WAIT(WaitClks))
+ *   AFECtrlS(ADCCNV|DFT|WG|ADCPWR, bFALSE)
+ *   ADCMuxCfgS(AIN3, AIN2)
+ *   AFECtrlS(WG|ADCPWR, bTRUE)
+ *   SEQGenInsert(SEQ_WAIT(16*50))
+ *   AFECtrlS(ADCCNV|DFT, bTRUE)
+ *   SEQGenInsert(SEQ_WAIT(WaitClks))
+ *   AFECtrlS(ADCCNV|DFT|WG|ADCPWR, bFALSE)
+ *   SWMatrixCfgS(D=OPEN, P=PL|PL2, N=NL|NL2, T=TRTIA)
+ *   SEQGpioCtrlS(0)
+ *   EnterSleepS()
+ *
+ * Shadow register state is passed from ad5940_bia_gen_init_seq(),
+ * matching ADI's SEQGen database that persists across init and
+ * measure sequence generation calls.
+ *
+ * Return: number of commands generated, or negative errno on failure
+ */
+static int ad5940_bia_gen_measure_seq(struct ad5940_priv *priv,
+				       u32 *buf, int buf_size,
+				       const struct seq_shadow_regs *shadow_in)
+{
+	struct seq_gen_buf sg;
+
+	sg.cmd = buf;
+	sg.len = 0;
+	sg.max_len = buf_size;
+
+	/*
+	 * Initialize shadow registers from the init sequence's final state.
+	 * This matches ADI's SEQGen behavior where the RegInfo database
+	 * persists between AppBIASeqCfgGen() and AppBIASeqMeasureGen().
+	 *
+	 * We cannot read these from hardware because the init sequence
+	 * hasn't executed yet at this point (only written to SRAM).
+	 * Passing them from the init sequence generator ensures correctness
+	 * without fragile manual computation of expected register values.
+	 */
+	if (shadow_in)
+		sg.shadow = *shadow_in;
+	else
+		memset(&sg.shadow, 0, sizeof(sg.shadow));
+
+	/* ---- Begin: exact AppBIASeqMeasureGen() call order ---- */
+
+	/* AD5940_SEQGpioCtrlS(AGPIO_Pin6) */
+	seq_gpio_ctrl(&sg, AD5940_AGPIO_Pin6);
+
+	/* AD5940_SEQGenInsert(SEQ_WAIT(16*250))  - wait 250us */
+	seq_wait(&sg, 16 * 250);
+
+	/* AD5940_SWMatrixCfgS: D=CE0, P=CE0, N=AIN1, T=AIN1|TRTIA */
+	seq_sw_matrix_cfg(&sg,
+			  AD5940_SWD_CE0,
+			  AD5940_SWP_CE0,
+			  AD5940_SWN_AIN1,
+			  AD5940_SWT_AIN1 | AD5940_SWT_TRTIA);
+
+	/* AD5940_ADCMuxCfgS(ADCMUXP_HSTIA_P, ADCMUXN_HSTIA_N) */
+	seq_adc_mux_cfg(&sg, AD5940_ADCMUXP_HSTIA_P, AD5940_ADCMUXN_HSTIA_N);
+
+	/* AD5940_AFECtrlS(AFECTRL_WG|AFECTRL_ADCPWR, bTRUE) */
+	seq_afe_ctrl(&sg,
+		     AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR,
+		     true);
+
+	/* AD5940_SEQGenInsert(SEQ_WAIT(16*50))  - wait 50us */
+	seq_wait(&sg, 16 * 50);
+
+	/* AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE) */
+	seq_afe_ctrl(&sg,
+		     AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT,
+		     true);
+
+	/* AD5940_SEQGenInsert(SEQ_WAIT(WaitClks)) */
+	seq_wait(&sg, AD5940_BIA_WAIT_CLKS);
+
+	/* AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE) */
+	seq_afe_ctrl(&sg,
+		     AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT |
+		     AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR,
+		     false);
+
+	/* AD5940_ADCMuxCfgS(ADCMUXP_AIN3, ADCMUXN_AIN2) */
+	seq_adc_mux_cfg(&sg, AD5940_ADCMUXP_AIN3, AD5940_ADCMUXN_AIN2);
+
+	/* AD5940_AFECtrlS(AFECTRL_WG|AFECTRL_ADCPWR, bTRUE) */
+	seq_afe_ctrl(&sg,
+		     AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR,
+		     true);
+
+	/* AD5940_SEQGenInsert(SEQ_WAIT(16*50))  - wait 50us (ADI's DFT_WAIT) */
+	seq_wait(&sg, 16 * 50);
+
+	/* AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE) */
+	seq_afe_ctrl(&sg,
+		     AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT,
+		     true);
+
+	/* AD5940_SEQGenInsert(SEQ_WAIT(WaitClks)) */
+	seq_wait(&sg, AD5940_BIA_WAIT_CLKS);
+
+	/* AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE) */
+	seq_afe_ctrl(&sg,
+		     AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT |
+		     AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR,
+		     false);
+
+	/* AD5940_SWMatrixCfgS: D=OPEN, P=PL|PL2, N=NL|NL2, T=TRTIA */
+	seq_sw_matrix_cfg(&sg,
+			  AD5940_SWD_OPEN,
+			  AD5940_SWP_PL | AD5940_SWP_PL2,
+			  AD5940_SWN_NL | AD5940_SWN_NL2,
+			  AD5940_SWT_TRTIA);
+
+	/* AD5940_SEQGpioCtrlS(0) */
+	seq_gpio_ctrl(&sg, 0);
+
+	/* AD5940_EnterSleepS() */
+	seq_enter_sleep(&sg);
+
+	return sg.len;
+}
+
 /* ------------------------------------------------------------------ */
 /*  BIA (Body Impedance) measurement setup                            */
 /*                                                                     */
@@ -340,10 +907,12 @@ EXPORT_SYMBOL_GPL(ad5940_seq_cmd_write);
 int ad5940_bia_init(struct ad5940_priv *priv)
 {
 	struct device *dev = &priv->spi->dev;
-	static const u32 init_seq[] = { SEQ_STOP() };
-	u32 meas_seq_addr = ARRAY_SIZE(init_seq);
+	int init_seq_len = 0;
+	u32 meas_seq_addr = 0;
+	int meas_seq_len = 0;
 	int ret, i, rd;
 	u32 val, reg_osccon, fifocon_saved, tempreg;
+	struct seq_shadow_regs init_shadow;
 
 	/* ================================================================
 	 * AD5940PlatformCfg() - EXACT order from AD5940Main.c
@@ -604,6 +1173,7 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 	/* SeqEnable=FALSE → SEQCON = 0 (already done above) */
 
 	/* Restore FIFOCON */
+	ad5940_spi_write(priv, AD5940_REG_SEQCON, 0);
 	ad5940_spi_write(priv, AD5940_REG_FIFOCON, fifocon_saved);
 
 	/* ---- AppBIAInit Step 3: RTIA calibration (SKIPPED) ---- */
@@ -614,8 +1184,15 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 	 */
 
 	/* ---- AppBIAInit Step 4: AD5940_FIFOCtrlS(DFT, FALSE) ---- */
-	/* ADI: disable FIFO before reconfiguring */
-	ad5940_spi_write(priv, AD5940_REG_FIFOCON, 0);
+	/*
+	 * ADI FIFOCtrlS(FIFOSRC_DFT, bFALSE):
+	 *   tempreg = 0;  (no DATAFIFOEN since FifoEn=FALSE)
+	 *   tempreg |= FIFOSRC_DFT << BITP_AFE_FIFOCON_DATAFIFOSRCSEL;
+	 *   WriteReg(REG_AFE_FIFOCON, tempreg);
+	 * → FIFOCON = 2 << 13 = 0x4000
+	 */
+	ad5940_spi_write(priv, AD5940_REG_FIFOCON,
+			 2 << AD5940_FIFOCON_DATAFIFOSRCSEL_SHIFT);
 
 	/* ---- AppBIAInit Step 5: AD5940_FIFOCfg(enable, FIFO, 4KB, DFT, thresh=4) ---- */
 	/*
@@ -642,60 +1219,127 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 	/* ---- AppBIAInit Step 6: AD5940_INTCClrFlag(ALLINT) ---- */
 	ad5940_spi_write(priv, AD5940_REG_INTCCLR, AD5940_AFEINTSRC_ALLINT);
 
-	/* ---- AppBIAInit Step 7: Write BIA init register table ---- */
+	/* ---- AppBIAInit Step 7+8: Generate and write init sequence (SEQID_1) ---- */
 	/*
-	 * Corresponds to AppBIASeqCfgGen() which configures:
-	 * REFCfgS, HSLoopCfgS, LPLoopCfgS, DSPCfgS, AFECtrlS, SEQGpioCtrlS.
-	 * All register writes done directly (not via sequencer).
+	 * ADI's AppBIASeqCfgGen() uses the sequence generator to produce
+	 * SEQ_WR commands for all init register writes (REFCfgS, HSLoopCfgS,
+	 * LPLoopCfgS, DSPCfgS, AFECtrlS, SEQGpioCtrlS). The generated
+	 * commands are written to SRAM and executed by SEQID_1.
+	 *
+	 * We replicate this by calling ad5940_bia_gen_init_seq() which
+	 * produces the exact same SEQ_WR commands as ADI's generator.
 	 */
-	for (i = 0; i < ARRAY_SIZE(ad5940_bia_init_regs); i++) {
-		u16 addr = ad5940_bia_init_regs[i].addr;
-		u32 new_val = ad5940_bia_init_regs[i].val;
+	{
+		u32 init_buf[128];  /* 128 words = plenty for init sequence */
+		int init_len;
 
-		if (addr == AD5940_REG_AFECON) {
-			rd = ad5940_spi_read(priv, AD5940_REG_AFECON);
-			if (rd < 0) {
-				dev_err(dev, "BIA: AFECON read failed: %d\n", rd);
-				return rd;
-			}
-			val = (rd & ~AD5940_AFECON_HPREFDIS) | new_val;
-			ret = ad5940_spi_write(priv, addr, val);
-		} else if (addr == AD5940_REG_BUFSENCON) {
-			rd = ad5940_spi_read(priv, AD5940_REG_BUFSENCON);
-			if (rd < 0)
-				return rd;
-			val = rd | new_val;
-			ret = ad5940_spi_write(priv, addr, val);
-		} else {
-			ret = ad5940_spi_write(priv, addr, new_val);
+		init_len = ad5940_bia_gen_init_seq(priv, init_buf,
+						   ARRAY_SIZE(init_buf),
+						   &init_shadow);
+		if (init_len < 0) {
+			dev_err(dev, "BIA: init sequence generation failed: %d\n",
+				init_len);
+			return init_len;
+		}
+		if (init_len == 0) {
+			dev_err(dev, "BIA: init sequence is empty!\n");
+			return -EINVAL;
 		}
 
+		dev_info(dev, "BIA: generated init sequence: %d commands\n",
+			 init_len);
+
+		/* Debug: print generated init sequence */
+		{
+			int k;
+			for (k = 0; k < init_len; k++)
+				dev_info(dev, "  init[%d] = 0x%08x\n", k,
+					 init_buf[k]);
+		}
+
+		ret = ad5940_seq_cmd_write(priv, 0, init_buf, init_len);
 		if (ret) {
-			dev_err(dev, "BIA: reg 0x%04x write failed: %d\n",
-				addr, ret);
+			dev_err(dev, "BIA: init seq SRAM write failed: %d\n",
+				ret);
 			return ret;
 		}
-	}
 
-	/* ---- AppBIAInit Step 8: Program init sequence (SEQID_1) into SRAM ---- */
-	ret = ad5940_seq_cmd_write(priv, 0, init_seq, ARRAY_SIZE(init_seq));
-	if (ret) {
-		dev_err(dev, "BIA: init seq SRAM write failed: %d\n", ret);
-		return ret;
+		/* Measure sequence starts right after init sequence */
+		meas_seq_addr = init_len;
+		init_seq_len = init_len;
 	}
 
 	/* ---- AppBIAInit Step 9: Program measure sequence (SEQID_0) into SRAM ---- */
-	ret = ad5940_seq_cmd_write(priv, meas_seq_addr,
-				   ad5940_bia_measure_seq,
-				   ARRAY_SIZE(ad5940_bia_measure_seq));
-	if (ret) {
-		dev_err(dev, "BIA: measure seq SRAM write failed: %d\n", ret);
-		return ret;
+	/*
+	 * Use ADI-style sequence generator to produce the exact same
+	 * sequence as AppBIASeqMeasureGen() in BodyImpedance.c.
+	 * Shadow register state is passed from init sequence generation,
+	 * matching ADI's SEQGen database that persists between calls.
+	 */
+	{
+		u32 meas_buf[128];  /* 128 words = plenty for BIA sequence */
+		int meas_len;
+
+		meas_len = ad5940_bia_gen_measure_seq(priv, meas_buf,
+						      ARRAY_SIZE(meas_buf),
+						      &init_shadow);
+		if (meas_len < 0) {
+			dev_err(dev, "BIA: measure sequence generation failed: %d\n",
+				meas_len);
+			return meas_len;
+		}
+		if (meas_len == 0) {
+			dev_err(dev, "BIA: measure sequence is empty!\n");
+			return -EINVAL;
+		}
+
+		dev_info(dev, "BIA: generated measure sequence: %d commands\n",
+			 meas_len);
+
+		/* Debug: print generated sequence */
+		{
+			int k;
+			for (k = 0; k < meas_len; k++)
+				dev_info(dev, "  seq[%d] = 0x%08x\n", k,
+					 meas_buf[k]);
+		}
+
+		ret = ad5940_seq_cmd_write(priv, meas_seq_addr,
+					   meas_buf, meas_len);
+		if (ret) {
+			dev_err(dev, "BIA: measure seq SRAM write failed: %d\n",
+				ret);
+			return ret;
+		}
+
+		/* Clear SRAM after measure sequence */
+		{
+			int clear_start = meas_seq_addr + meas_len;
+			int clear_end = 512; // 2KB SRAM 容量 / 每 command 4字节 = 512 个 word
+			int j;
+
+			for (j = clear_start; j < clear_end; j++) {
+				ad5940_spi_write(priv, AD5940_REG_CMDFIFOWADDR,
+						 j);
+				ad5940_spi_write(priv, AD5940_REG_CMDFIFOWRITE,
+						 0);
+			}
+			dev_info(dev, "BIA: cleared SRAM [%d..%d] with NOPs\n",
+				 clear_start, clear_end - 1);
+		}
+
+		/* Store meas_len for SEQ0INFO below */
+		meas_seq_len = meas_len;
 	}
 
 	/* ---- AppBIAInit Step 10: SEQInfoCfg(InitSeqInfo, WriteSRAM=FALSE) ---- */
+	/*
+	 * SEQ1INFO format: [31:16] = SeqLen (command count),
+	 *                   [9:0]   = SeqRamAddr (SRAM start address)
+	 * Init sequence was written starting at SRAM address 0.
+	 */
 	ret = ad5940_spi_write(priv, AD5940_REG_SEQ1INFO,
-			       (ARRAY_SIZE(init_seq) << 16) | 0);
+			       (init_seq_len << 16) | 0);
 	if (ret) {
 		dev_err(dev, "BIA: SEQ1INFO write failed: %d\n", ret);
 		return ret;
@@ -729,6 +1373,10 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 	val |= AD5940_SEQMEMSIZE_2KB << AD5940_BITP_CMDDATACON_CMD_MEM_SEL;
 	ad5940_spi_write(priv, AD5940_REG_CMDDATACON, val);
 
+	/* SeqCntCRCClr: disable sequencer + clear counter */
+	ad5940_spi_write(priv, AD5940_REG_SEQCON, 0);
+	ad5940_spi_write(priv, AD5940_REG_SEQCNT, 0);
+
 	/* SeqEnable=TRUE */
 	ad5940_spi_write(priv, AD5940_REG_SEQCON, BIT(0));
 
@@ -753,7 +1401,7 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 
 	/* ---- AppBIAInit Step 14: SEQInfoCfg(MeasureSeqInfo, WriteSRAM=FALSE) ---- */
 	ret = ad5940_spi_write(priv, AD5940_REG_SEQ0INFO,
-			       (ARRAY_SIZE(ad5940_bia_measure_seq) << 16) |
+			       (meas_seq_len << 16) |
 			       meas_seq_addr);
 	if (ret) {
 		dev_err(dev, "BIA: SEQ0INFO write failed: %d\n", ret);
@@ -782,12 +1430,19 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 	val |= AD5940_SEQMEMSIZE_2KB << AD5940_BITP_CMDDATACON_CMD_MEM_SEL;
 	ad5940_spi_write(priv, AD5940_REG_CMDDATACON, val);
 
+	/* SeqCntCRCClr: disable sequencer + clear counter */
+	ad5940_spi_write(priv, AD5940_REG_SEQCON, 0);
+	ad5940_spi_write(priv, AD5940_REG_SEQCNT, 0);
+
 	ad5940_spi_write(priv, AD5940_REG_SEQCON, BIT(0));
 
 	ad5940_spi_write(priv, AD5940_REG_FIFOCON, fifocon_saved);
 
 	/* ---- AppBIAInit Step 16: ClrMCUIntFlag ---- */
-	ad5940_spi_write(priv, AD5940_REG_INTCCLR, AD5940_AFEINTSRC_ALLINT);
+	/* ADI's ClrMCUIntFlag() clears the MCU-side GPIO interrupt flag,
+	 * not AD5940's AFE interrupt flags. In Linux, the kernel IRQ
+	 * subsystem handles this automatically. No AD5940 register write needed.
+	 */
 
 	/* ---- AppBIAInit Step 17: AFEPwrBW(AFEPWR_LP, AFEBW_250K) ---- */
 	ret = ad5940_spi_write(priv, AD5940_REG_PMBW,
@@ -810,15 +1465,16 @@ EXPORT_SYMBOL_GPL(ad5940_bia_init);
  * @priv: driver private data
  *
  * Faithfully replicates AppBIACtrl(BIACTRL_START) from BodyImpedance.c,
- * with additional FIFO/INTC cleanup for reliable restart.
+ * with additional FIFO/INTC cleanup to ensure clean state after a
+ * previous stop/restart cycle.
  *
- * ADI's original flow is just WakeUp + WUPTCfg, but that assumes the
- * FIFO and interrupt flags are clean. After a stop→start cycle, stale
- * FIFO data and interrupt flags can prevent new DFT results from being
- * written. We therefore:
+ * ADI's exact flow is:
  *   1. WakeUp AFE
- *   2. Reset FIFO (disable → re-enable) and clear all interrupt flags
- *   3. Configure WUPT (WakeupTimer) and enable it
+ *   2. Configure WUPT and enable it
+ *
+ * We add:
+ *   - FIFO reset (disable/re-enable) to flush stale data
+ *   - INTC flag clearing to ensure GP0 is high before WUPT starts
  *
  * Return: 0 on success, negative errno on failure
  */
@@ -828,60 +1484,60 @@ int ad5940_bia_start(struct ad5940_priv *priv)
 	int ret;
 	u32 sleep_time;
 
-	/* ---- Step 1: Wake up AFE (AD5940_WakeUp) ---- */
+	/* ---- Step 1: Wake up AFE (AD5940_WakeUp(10)) ---- */
 	ret = ad5940_wakeup(priv);
 	if (ret) {
 		dev_err(dev, "BIA start: wakeup failed: %d\n", ret);
 		return ret;
 	}
 
-	/* ---- Step 2: Reset FIFO and clear interrupt flags ---- */
+	/* ---- Step 1b: Clean up FIFO and INTC state ---- */
 	/*
-	 * After bia_stop(), the FIFO may contain stale data and INTC flags
-	 * may be set. This prevents new DFT results from triggering the
-	 * FIFO threshold interrupt, causing the kernel to never read data.
+	 * After a previous stop, the FIFO may contain stale data and
+	 * the INTC DATAFIFOTHRESH flag may be set (keeping GP0 low).
+	 * Without cleanup, no falling edge is generated when new data
+	 * arrives, so the Linux IRQ (edge-triggered) never fires.
 	 *
-	 * Reset sequence (mirrors FIFOCfg pattern from bia_init):
-	 *   a) Disable FIFO
-	 *   b) Clear all interrupt flags
-	 *   c) Re-enable FIFO with DFT source + threshold
+	 * Lock sleep key to prevent hibernate during register access.
 	 */
-	/* 2a: Disable FIFO */
+	ad5940_spi_write(priv, AD5940_REG_SEQSLPLOCK, AD5940_SLPKEY_LOCK);
+
+	/* Reset FIFO: disable then re-enable (clears FIFO pointers/count) */
 	ad5940_spi_write(priv, AD5940_REG_FIFOCON, 0);
-
-	/* 2b: Clear all interrupt flags (both INTC0 and INTC1) */
-	ad5940_spi_write(priv, AD5940_REG_INTCCLR, AD5940_AFEINTSRC_ALLINT);
-
-	/* 2c: Re-enable FIFO: FIFOSRC=DFT(2), DATAFIFOEN, threshold=4 */
-	ad5940_spi_write(priv, AD5940_REG_DATAFIFOTHRES,
-			 AD5940_FIFO_THRESHOLD << AD5940_DATAFIFOTHRES_HIGHTHRES_SHIFT);
 	ad5940_spi_write(priv, AD5940_REG_FIFOCON,
 			 AD5940_FIFOCON_DATAFIFOEN |
 			 (2 << AD5940_FIFOCON_DATAFIFOSRCSEL_SHIFT));
 
-	/* ---- Step 3: Configure WUPT (AD5940_WUPTCfg) ---- */
+	/* Clear all AFE interrupt flags (ensures GP0 goes high) */
+	ad5940_spi_write(priv, AD5940_REG_INTCCLR, AD5940_AFEINTSRC_ALLINT);
+
+	/* Unlock sleep key (allow AFE to hibernate after each measurement) */
+	ad5940_spi_write(priv, AD5940_REG_SEQSLPLOCK, AD5940_SLPKEY_UNLOCK);
+
+	priv->running = true;
+
+	/* ---- Step 2: Configure WUPT (AD5940_WUPTCfg) ---- */
 	/*
 	 * From ADI's AppBIACtrl(BIACTRL_START):
 	 *   wupt_cfg.WuptEn = bTRUE;
 	 *   wupt_cfg.WuptEndSeq = WUPTENDSEQ_A;
 	 *   wupt_cfg.WuptOrder[0] = SEQID_0;
 	 *   wupt_cfg.SeqxSleepTime[SEQID_0] =
-	 *       (uint32_t)(WuptClkFreq / BiaODR) - 2 - 1;
+	 *       (uint32_t)(WuptClkFreq/BiaODR)-2-1;
 	 *   wupt_cfg.SeqxWakeupTime[SEQID_0] = 1;
 	 *   AD5940_WUPTCfg(&wupt_cfg);
+	 *   FifoDataCount = 0;  // restart
 	 *
 	 * AD5940_WUPTCfg() does:
-	 *   a) Write SEQ0 WAKEUP time (low + high)
-	 *   b) Write SEQ0 SLEEP time (low + high)
-	 *   c) Write SEQ1-3 WAKEUP/SLEEP time (all zeros - unused)
-	 *   d) Write TMRCON: enable WUPT to wake up AFE
-	 *   e) Write SEQORDER: position A = SEQID_0
-	 *   f) Write WUPTCON: EN=1, ENDSEQ=A
+	 *   a) Write SEQ0-3 WAKEUP/SLEEP time
+	 *   b) Write TMRCON: enable WUPT to wake up AFE
+	 *   c) Write SEQORDER: position A = SEQID_0
+	 *   d) Write WUPTCON: EN=1, ENDSEQ=A
 	 */
 
 	sleep_time = (u32)(AD5940_BIA_WUPT_CLK_FREQ / AD5940_BIA_ODR) - 2 - 1;
 
-	/* 3a: SEQ0 wakeup time = 1 (minimum, per ADI) */
+	/* 2a: SEQ0 wakeup time = 1 (minimum, per ADI) */
 	ret = ad5940_spi_write(priv, AD5940_REG_WUPTSEQ0WUPL, 1);
 	if (ret)
 		return ret;
@@ -889,7 +1545,7 @@ int ad5940_bia_start(struct ad5940_priv *priv)
 	if (ret)
 		return ret;
 
-	/* 3b: SEQ0 sleep time */
+	/* 2b: SEQ0 sleep time */
 	ret = ad5940_spi_write(priv, AD5940_REG_WUPTSEQ0SLEEPL,
 			       sleep_time & 0xFFFF);
 	if (ret)
@@ -899,7 +1555,7 @@ int ad5940_bia_start(struct ad5940_priv *priv)
 	if (ret)
 		return ret;
 
-	/* 3c: SEQ1-3 wakeup/sleep time = 0 (unused) - ADI writes all of them */
+	/* 2c: SEQ1-3 wakeup/sleep time = 0 (unused) - ADI writes all of them */
 	ad5940_spi_write(priv, 0x0818, 0);  /* SEQ1WUPL */
 	ad5940_spi_write(priv, 0x081C, 0);  /* SEQ1WUPH */
 	ad5940_spi_write(priv, 0x0820, 0);  /* SEQ1SLEEPL */
@@ -913,17 +1569,17 @@ int ad5940_bia_start(struct ad5940_priv *priv)
 	ad5940_spi_write(priv, 0x0840, 0);  /* SEQ3SLEEPL */
 	ad5940_spi_write(priv, 0x0844, 0);  /* SEQ3SLEEPH */
 
-	/* 3d: TMRCON - allow WUPT to wake up AFE (per ADI) */
+	/* 2d: TMRCON - allow WUPT to wake up AFE (per ADI) */
 	ret = ad5940_spi_write(priv, AD5940_REG_ALLON_TMRCON, BIT(0));
 	if (ret)
 		return ret;
 
-	/* 3e: SEQORDER - position A = SEQID_0 (=0) */
+	/* 2e: SEQORDER - position A = SEQID_0 (=0) */
 	ret = ad5940_spi_write(priv, AD5940_REG_WUPTSEQORDER, 0x00);
 	if (ret)
 		return ret;
 
-	/* 3f: WUPTCON - enable WUPT, ENDSEQ = position A (0) */
+	/* 2f: WUPTCON - enable WUPT, ENDSEQ = position A (0) */
 	ret = ad5940_spi_write(priv, AD5940_REG_WUPTCON,
 			       AD5940_WUPTCON_EN |
 			       (0 << AD5940_WUPTCON_ENDSEQ_SHIFT));
@@ -1012,6 +1668,25 @@ int ad5940_bia_start(struct ad5940_priv *priv)
 	// 		 fifocnt, intcflag0, intcflag1, afecon);
 	// }
 
+	// /* ---- Debug: read back WUPT registers to verify ---- */
+	// {
+	// 	int wupt_wupl, wupt_wuph, wupt_sleepl, wupt_sleeph;
+	// 	int wupt_seqorder, wuptcon, tmrcon;
+
+	// 	wupt_wupl = ad5940_spi_read(priv, AD5940_REG_WUPTSEQ0WUPL);
+	// 	wupt_wuph = ad5940_spi_read(priv, AD5940_REG_WUPTSEQ0WUPH);
+	// 	wupt_sleepl = ad5940_spi_read(priv, AD5940_REG_WUPTSEQ0SLEEPL);
+	// 	wupt_sleeph = ad5940_spi_read(priv, AD5940_REG_WUPTSEQ0SLEEPH);
+	// 	wupt_seqorder = ad5940_spi_read(priv, AD5940_REG_WUPTSEQORDER);
+	// 	wuptcon = ad5940_spi_read(priv, AD5940_REG_WUPTCON);
+	// 	tmrcon = ad5940_spi_read(priv, AD5940_REG_ALLON_TMRCON);
+
+	// 	dev_info(dev, "WUPT readback: WUPL=%d WUPH=%d SLEEPL=%d SLEEPH=%d "
+	// 		 "SEQORDER=0x%x WUPTCON=0x%x TMRCON=0x%x sleep_time=%d\n",
+	// 		 wupt_wupl, wupt_wuph, wupt_sleepl, wupt_sleeph,
+	// 		 wupt_seqorder, wuptcon, tmrcon, sleep_time);
+	// }
+
 	dev_info(dev, "BIA: measurement started (ODR=%dHz, ADI flow replicated)\n",
 		 AD5940_BIA_ODR);
 	return 0;
@@ -1019,11 +1694,27 @@ int ad5940_bia_start(struct ad5940_priv *priv)
 EXPORT_SYMBOL_GPL(ad5940_bia_start);
 
 /**
- * ad5940_bia_stop - Stop BIA measurement by disabling Wakeup Timer
+ * ad5940_bia_stop - Stop BIA measurement (STOPNOW with cleanup)
  * @priv: driver private data
  *
- * Faithfully replicates AppBIACtrl(BIACTRL_STOPNOW) from BodyImpedance.c.
- * ADI disables WUPT, then calls WUPTCtrl(FALSE) again as a safety measure.
+ * Stops the WUPT timer immediately and cleans up FIFO/INTC state.
+ *
+ * IMPORTANT: We cannot use ADI's STOPSYNC pattern in the Linux kernel
+ * because it depends on the trigger handler (ISR bottom half) to
+ * disable WUPT after reading FIFO data.  When the IIO buffer is
+ * disabled, the trigger handler is not scheduled, so the stop never
+ * completes.  This leaves WUPT running, which causes FIFO interrupts
+ * that disable the Linux IRQ via disable_irq_nosync() without a
+ * matching enable_irq(), permanently blocking all future interrupts.
+ *
+ * Instead, we use STOPNOW (wake AFE + disable WUPT immediately),
+ * protected by the sleep key to prevent the race condition where
+ * the sequencer puts AFE back to hibernate between our wake-up
+ * and WUPT disable.
+ *
+ * After stopping WUPT, we also reset the FIFO and clear INTC flags
+ * so that GP0 returns high, ensuring the next start will produce a
+ * clean falling edge when the FIFO threshold is reached.
  *
  * Return: 0 on success, negative errno on failure
  */
@@ -1032,15 +1723,48 @@ int ad5940_bia_stop(struct ad5940_priv *priv)
 	struct device *dev = &priv->spi->dev;
 	int ret;
 
-	/* Disable WUPT (AD5940_WUPTCtrl(bFALSE)) */
-	ret = ad5940_spi_write(priv, AD5940_REG_WUPTCON, 0);
-	if (ret)
-		return ret;
+	if (!priv->running)
+		return 0;  /* Already stopped */
 
-	/* ADI calls WUPTCtrl(FALSE) again for safety (race condition with
-	 * sequencer potentially putting AFE back to hibernate).
-	 */
+	/* ---- Step 1: Wake up AFE ---- */
+	ret = ad5940_wakeup(priv);
+	if (ret) {
+		dev_err(dev, "BIA stop: wakeup failed: %d\n", ret);
+		return ret;
+	}
+
+	/* ---- Step 2: Lock sleep key to prevent hibernate ---- */
+	ad5940_spi_write(priv, AD5940_REG_SEQSLPLOCK, AD5940_SLPKEY_LOCK);
+
+	/* ---- Step 3: Disable WUPT (write twice per ADI safety) ---- */
 	ad5940_spi_write(priv, AD5940_REG_WUPTCON, 0);
+	ad5940_spi_write(priv, AD5940_REG_WUPTCON, 0);
+
+	/* ---- Step 4: Reset FIFO (flush stale data) ---- */
+	ad5940_spi_write(priv, AD5940_REG_FIFOCON, 0);
+	ad5940_spi_write(priv, AD5940_REG_FIFOCON,
+			 AD5940_FIFOCON_DATAFIFOEN |
+			 (2 << AD5940_FIFOCON_DATAFIFOSRCSEL_SHIFT));
+
+	/* ---- Step 5: Clear all AFE interrupt flags ---- */
+	ad5940_spi_write(priv, AD5940_REG_INTCCLR, AD5940_AFEINTSRC_ALLINT);
+
+	/* ---- Step 6: Unlock sleep key ---- */
+	ad5940_spi_write(priv, AD5940_REG_SEQSLPLOCK, AD5940_SLPKEY_UNLOCK);
+
+	priv->running = false;
+
+	/*
+	 * Step 7: Re-enable the Linux IRQ if it was disabled by our
+	 * hard IRQ handler but never re-enabled by the trigger handler.
+	 * This can happen if a GPIO interrupt fired after the IIO buffer
+	 * was disabled (but before WUPT was stopped), causing
+	 * disable_irq_nosync() without a matching enable_irq().
+	 */
+	if (priv->irq_disabled) {
+		enable_irq(priv->irq);
+		priv->irq_disabled = false;
+	}
 
 	dev_info(dev, "BIA: measurement stopped\n");
 	return 0;

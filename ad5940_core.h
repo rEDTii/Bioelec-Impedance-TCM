@@ -56,6 +56,10 @@
 #define AD5940_REG_BUFSENCON		0x2180
 #define AD5940_REG_ADCCON		0x21A8
 #define AD5940_REG_ADCFILTERCON		0x2044
+#define AD5940_REG_ADCMIN		0x20A8
+#define AD5940_REG_ADCMINSM		0x20AC
+#define AD5940_REG_ADCMAX		0x20B0
+#define AD5940_REG_ADCMAXSMEN		0x20B4
 #define AD5940_REG_DSWFULLCON		0x2150
 #define AD5940_REG_NSWFULLCON		0x2154
 #define AD5940_REG_PSWFULLCON		0x2158
@@ -69,6 +73,7 @@
 #define AD5940_REG_SEQTRGSLP		0x211C
 #define AD5940_REG_SEQ0INFO		0x21CC
 #define AD5940_REG_SEQ1INFO		0x21E8
+#define AD5940_REG_STATSCON		0x21C4
 #define AD5940_REG_CMDFIFOWADDR		0x21D4
 #define AD5940_REG_CMDFIFOWRITE		0x2070
 #define AD5940_REG_CMDDATACON		0x21D8
@@ -155,6 +160,7 @@
 #define AD5940_AFECON_EXTBUFPWR		BIT(9)	/* EXBUFEN */
 #define AD5940_AFECON_INAMPPWR		BIT(10)	/* INAMPEN */
 #define AD5940_AFECON_HSTIAPWR		BIT(11)	/* TIAEN */
+#define AD5940_AFECON_ALDOILIMITEN	BIT(19)	/* inverted! 0=enable LDO limit */
 #define AD5940_AFECON_WG		BIT(14)	/* WAVEGENEN */
 #define AD5940_AFECON_DFT		BIT(15)	/* DFTEN */
 #define AD5940_AFECON_SINC2NOTCH	BIT(16)	/* SINC2EN */
@@ -216,6 +222,10 @@
 #define AD5940_ADCFILTERCON_SINC3OSR_SHIFT	12	/* bits[13:12] */
 #define AD5940_ADCFILTERCON_AVRGNUM_SHIFT	14	/* bits[15:14] */
 
+/* ADCFILTERCON bit masks - Source: BITM_AFE_ADCFILTERCON_* */
+#define AD5940_ADCFILTERCON_AVRGEN		BIT(7)	/* Average function enable */
+#define AD5940_ADCFILTERCON_LPFBYPEN		BIT(4)	/* Bypass 50/60Hz LP filter */
+
 /* ADC enum values */
 #define AD5940_ADCRATE_800KHZ		1
 #define AD5940_ADCSINC3OSR_2		2
@@ -252,7 +262,7 @@
 
 /* Sleep key values */
 #define AD5940_SLPKEY_UNLOCK			0x0A47E5
-#define AD5940_SLPKEY_LOCK			0x0A47E0
+#define AD5940_SLPKEY_LOCK			0x0
 
 /* Switch matrix bit definitions - Source: SWD_xxx, SWP_xxx, SWN_xxx, SWT_xxx */
 /* D-switch */
@@ -356,6 +366,7 @@
  *   SLP:  WR to SEQTRGSLP with value 1 (triggers sleep/hibernate)
  */
 #define SEQ_WAIT(clks)		(0x00000000u | ((u32)(clks) & 0x3FFFFFFFu))
+#define SEQ_NOP		0x00000000u  /* Same as SEQ_WAIT(0) */
 #define SEQ_WR(addr, data)	(0x80000000u | ((((u32)(addr) >> 2) & 0x7Fu) << 24) \
 				 | ((u32)(data) & 0x00FFFFFFu))
 #define SEQ_STOP()		SEQ_WR(AD5940_REG_SEQCON, 0x00)
@@ -449,185 +460,12 @@ static const struct {
  *
  * WG amplitude word for 800mVpp:
  *   AmpWord = round(800/800 * 2047) = 2047 = 0x7FF
+ *
+ * NOTE: The init register table (ad5940_bia_init_regs[]) has been replaced
+ * by ad5940_bia_gen_init_seq() which generates SEQ_WR commands matching
+ * ADI's AppBIASeqCfgGen() flow. The init sequence is now executed by
+ * the AD5940 sequencer (SEQID_1), not via direct SPI writes.
  */
-static const struct {
-	u16 addr;
-	u32 val;
-} ad5940_bia_init_regs[] = {
-	/*
-	 * 1. HP Reference configuration (AD5940_REFCfgS)
-	 *    BUFSENCON: enable HP 1.8V + HP 1.1V buffers
-	 *    BITP_AFE_BUFSENCON_V1P8HPADCEN=0, V1P1HPADCEN=4
-	 *    → BIT(0) | BIT(4) = 0x11
-	 */
-	{ AD5940_REG_BUFSENCON, 0x11 },
-
-	/* LPREFBUFCON: all enabled (0x00 = LP bandgap on, LP buf on) */
-	{ AD5940_REG_LPREFBUFCON, 0x00 },
-
-	/*
-	 * 2. AFECON: clear HPREFDIS (bit5=0) to enable HP reference.
-	 *    This entry is handled via read-modify-write at runtime.
-	 */
-	{ AD5940_REG_AFECON, 0x00 },
-
-	/*
-	 * 3. HSLoop - HSDAC configuration (AD5940_HSDacCfgS)
-	 *    ExcitBufGain=2 (no INAMPGNMDE), HsDacGain=1 (no ATTENEN)
-	 *    HsDacUpdateRate=7 → 7<<1 = 0x0E
-	 */
-	{ AD5940_REG_HSDACCON, (7 << AD5940_HSDACCON_RATE_SHIFT) },
-
-	/*
-	 * 4. HSLoop - HSTIA configuration (AD5940_HSTIACfgS)
-	 *    HstiaBias = HSTIABIAS_1P1 (=0)
-	 *    BITP_AFE_HSTIACON_VBIASSEL=0, value 0 → HSTIACON = 0x00
-	 */
-	{ AD5940_REG_HSTIACON, 0x00 },
-
-	/*
-	 *    HSRTIACON: Ctia=16<<5=0x200, RtiaSel=HSTIARTIA_1K=1
-	 *    BITP_AFE_HSRTIACON_CTIACON=5, RTIACON=bits[3:0]
-	 *    → 0x200 | 0x01 = 0x201
-	 */
-	{ AD5940_REG_HSRTIACON,
-		(16 << AD5940_HSRTIACON_CTIACON_SHIFT) | AD5940_HSTIARTIA_1K },
-
-	/*
-	 *    DE0RESCON: DeRtia=OPEN (0x1F<<3=0xF8), DeRload=OPEN (=5)
-	 *    → 0xF8 | 0x05 = 0xFD
-	 */
-	{ AD5940_REG_DE0RESCON,
-		(AD5940_HSTIADERTIA_OPEN << 3) | AD5940_HSTIADERLOAD_OPEN },
-
-	/*
-	 * 5. HSLoop - Switch matrix, init state (PL/NL closed, CE open)
-	 *    D=SWD_OPEN=0, P=SWP_PL|SWP_PL2, N=SWN_NL|SWN_NL2,
-	 *    T=SWT_TRTIA
-	 *    P = BIT(13)|BIT(14) = 0x6000
-	 *    N = BIT(10)|BIT(11) = 0x0C00
-	 *    T = BIT(8)          = 0x0100
-	 */
-	{ AD5940_REG_DSWFULLCON, AD5940_SWD_OPEN },
-	{ AD5940_REG_PSWFULLCON, AD5940_SWP_PL | AD5940_SWP_PL2 },
-	{ AD5940_REG_NSWFULLCON, AD5940_SWN_NL | AD5940_SWN_NL2 },
-	{ AD5940_REG_TSWFULLCON, AD5940_SWT_TRTIA },
-	/* Commit switch update */
-	{ AD5940_REG_SWCON, AD5940_SWCON_SWSOURCESEL },
-
-	/*
-	 * 6. HSLoop - WG configuration (AD5940_WGCfgS, WGTYPE_SIN=2)
-	 *    SinFreqWord = 0x33333 (50kHz @ 16MHz)
-	 *    SinAmplitudeWord = 0x7FF (800mVpp)
-	 *    SinPhaseWord = 0, SinOffsetWord = 0
-	 *    WGCON: WGTYPE_SIN=2, 2<<BITP_WGCON_TYPESEL(1) = 2<<1 = 0x04
-	 */
-	{ AD5940_REG_WGFCW, 0x33333 },
-	{ AD5940_REG_WGAMPLITUDE, 0x7FF },
-	{ AD5940_REG_WGOFFSET, 0x00 },
-	{ AD5940_REG_WGPHASE, 0x00 },
-	{ AD5940_REG_WGCON, (AD5940_WGTYPE_SIN << AD5940_WGCON_TYPESEL_SHIFT) },
-
-	/*
-	 * 7. LPLoop - LPDAC0 configuration (AD5940_LPDACCfgS)
-	 *    ADI order: LPDACCON0 → LPDACDAT0 → LPDACSW0
-	 *
-	 *    LPDACCON0: LpDacSrc=MMR(0)<<6, VzeroMux=6BIT(0)<<4,
-	 *               VbiasMux=12BIT(0)<<3, LpDacRef=2P5(0)<<2,
-	 *               DataRst=FALSE→RSTEN=1(bit0), PowerEn=TRUE→PWDEN=0(bit1)
-	 *    → 0x01
-	 */
-	{ AD5940_REG_LPDACCON0, 0x01 },
-
-	/*
-	 *    LPDACDAT0: DacData12Bit = (1100-200)/2200*4095 = 1671 = 0x687
-	 *               DacData6Bit = 31
-	 *    → (31<<12) | 1671 = 0xF000 | 0x687 = 0xF687
-	 */
-	{ AD5940_REG_LPDACDAT0, 0xF687 },
-
-	/*
-	 *    LPDACSW0: VBIAS2LPPA|VBIAS2PIN|VZERO2LPTIA|VZERO2PIN + LPMODEDIS
-	 *    = 0x10|0x08|0x04|0x02 | 0x20 = 0x3E
-	 */
-	{ AD5940_REG_LPDACSW0,
-		AD5940_LPDACSW_VBIAS2LPPA | AD5940_LPDACSW_VBIAS2PIN |
-		AD5940_LPDACSW_VZERO2LPTIA | AD5940_LPDACSW_VZERO2PIN |
-		AD5940_LPDACSW_LPMODEDIS },
-
-	/*
-	 * 8. LPLoop - LPTIA0 configuration (AD5940_LPAMPCfgS)
-	 *    LpTiaRf=LPTIARF_20K(=2), LpTiaRload=LPTIARLOAD_SHORT(=0)
-	 *    LpTiaRtia=LPTIARTIA_OPEN(=0)
-	 *    LPTIACON0: TIARF(13)=2<<13=0x4000
-	 */
-	{ AD5940_REG_LPTIACON0, AD5940_LPTIARF_20K << 13 },
-
-	/*
-	 *    LPTIASW0 (0x20E4):
-	 *    SW(5)|SW(6)|SW(7)|SW(8)|SW(9)|SW(12)|SW(13)
-	 *    = 0x20|0x40|0x80|0x100|0x200|0x1000|0x2000 = 0x33E0
-	 */
-	{ AD5940_REG_LPTIASW0,
-		AD5940_LPTIASW(5) | AD5940_LPTIASW(6) | AD5940_LPTIASW(7) |
-		AD5940_LPTIASW(8) | AD5940_LPTIASW(9) | AD5940_LPTIASW(12) |
-		AD5940_LPTIASW(13) },
-
-	/*
-	 * 9. DSP - ADC base configuration (AD5940_ADCBaseCfgS)
-	 *    ADCMuxP = ADCMUXP_HSTIA_P (=1), ADCMuxN = ADCMUXN_HSTIA_N (=1)
-	 *    ADCPga = ADCPGA_1 (=0)
-	 *    → (1<<0) | (1<<8) = 0x0101
-	 */
-	{ AD5940_REG_ADCCON,
-		(AD5940_ADCMUXP_HSTIA_P << AD5940_ADCCON_MUXSELP_SHIFT) |
-		(AD5940_ADCMUXN_HSTIA_N << AD5940_ADCCON_MUXSELN_SHIFT) },
-
-	/*
-	 * 10. DSP - ADC filter configuration (AD5940_ADCFilterCfgS)
-	 *     = BIT(0) | (2<<12) | (3<<14) | BIT(4)
-	 *     = 0x01 | 0x2000 | 0xC000 | 0x10 = 0xE011
-	 */
-	{ AD5940_REG_ADCFILTERCON,
-		BIT(0) |  /* ADCCLK=1 → 800kHz sample rate */
-		(AD5940_ADCSINC3OSR_2 << AD5940_ADCFILTERCON_SINC3OSR_SHIFT) |
-		(AD5940_ADCSINC2OSR_22 << AD5940_ADCFILTERCON_SINC2OSR_SHIFT) |
-		(AD5940_ADCAVGNUM_16 << AD5940_ADCFILTERCON_AVRGNUM_SHIFT) |
-		BIT(4) },  /* LPFBYPEN=1 (bypass notch, Sinc2NotchEnable=true) */
-
-	/*
-	 * 11. DSP - DFT configuration (AD5940_DFTCfgS)
-	 *     = BIT(0) | (11<<4) | (1<<20) = 0x1000B1
-	 */
-	{ AD5940_REG_DFTCON,
-		BIT(0) |  /* HANNINGEN=1 */
-		(AD5940_DFTNUM_8192 << AD5940_DFTCON_DFTNUM_SHIFT) |
-		(AD5940_DFTSRC_SINC3 << AD5940_DFTCON_DFTINSEL_SHIFT) },
-
-	/*
-	 * 12. Enable AFE modules (AD5940_AFECtrlS)
-	 *     HPRefPWR + HSTIAPWR + INAMPPWR + EXTBUFPWR +
-	 *     WG + DACREFPWR + HSDACPWR + SINC2NOTCH
-	 *
-	 *     Note: HPREFDIS is inverted (clear bit5 to enable).
-	 *     WG and ADCPWR/ADCCNV/DFT are NOT enabled here - they
-	 *     are toggled by the measure sequence.
-	 */
-	{ AD5940_REG_AFECON,
-		AD5940_AFECON_HSDACPWR | AD5940_AFECON_EXTBUFPWR |
-		AD5940_AFECON_INAMPPWR | AD5940_AFECON_HSTIAPWR |
-		AD5940_AFECON_DACREFPWR | AD5940_AFECON_SINC2NOTCH },
-
-	/*
-	 * 13. GPIO control for sequencer (AD5940_SEQGpioCtrlS)
-	 *     No GPIO pins set during init (0)
-	 */
-	{ AD5940_REG_SYNCEXTDEVICE, 0x00 },
-
-	/* NOTE: PMBW and SWMUX are NOT set here. They are set AFTER
-	 * the init sequence executes (see ad5940_bia_init), matching
-	 * ADI's AppBIAInit flow exactly. */
-};
 
 /*
  * BIA Measure sequence - Sequencer commands for one measurement cycle.
@@ -648,113 +486,44 @@ static const struct {
  *
  * Measure sequence total cycle time (approx):
  *   2 * WaitClks + 16*250 + 2*16*50 + ~20 (write commands) ≈ 2627330
- *   At 16MHz: ~164ms per cycle → MaxODR ≈ 6.1 Hz
+ *   AD5940_ClksCalculate with BIA params:
+ *     DataType=DFT, DftSrc=SINC3, DftNum=8192, Sinc3Osr=2, Sinc2Osr=22
+ *     = ((8192+2)*2+1)*20*1 + 25 = 327805
+ *   At 16MHz: ~20.5ms per DFT → MaxODR ≈ 48.8 Hz
  */
-#define AD5940_BIA_WAIT_CLKS	1310845
+#define AD5940_BIA_WAIT_CLKS	327805
 
-static const u32 ad5940_bia_measure_seq[] = {
-	/* ---- Step 0: GPIO and initial wait ---- */
-	/* SEQ_GPIO: set GP6 high at start of measurement (debug) */
-	SEQ_WR(AD5940_REG_SYNCEXTDEVICE, 0x40),
-	/* Wait 250us (16 clocks per us @ 16MHz → 16*250 = 4000) */
-	SEQ_WAIT(4000),
+/*
+ * AFECTRL bit definitions - matching ADI's AFECTRL_* constants.
+ * These are the AFECON register bits that AFECtrlS modifies.
+ * Note: AFECTRL_HPREFPWR(bit5) and AFECTRL_ALDOLIMIT(bit19) have
+ * inverted semantics in AFECON (set=disable).
+ */
+#define AD5940_AFECTRL_HPREFPWR		BIT(5)
+#define AD5940_AFECTRL_HSDACPWR		BIT(6)
+#define AD5940_AFECTRL_ADCPWR		BIT(7)
+#define AD5940_AFECTRL_ADCCNV		BIT(8)
+#define AD5940_AFECTRL_EXTBUFPWR		BIT(9)
+#define AD5940_AFECTRL_INAMPPWR		BIT(10)
+#define AD5940_AFECTRL_HSTIAPWR		BIT(11)
+#define AD5940_AFECTRL_WG			BIT(14)
+#define AD5940_AFECTRL_DFT			BIT(15)
+#define AD5940_AFECTRL_SINC2NOTCH		BIT(16)
+#define AD5940_AFECTRL_ALDOLIMIT		BIT(19)
+#define AD5940_AFECTRL_DACREFPWR		BIT(20)
 
-	/* ---- Step 1: Current DFT (ADC MUX = HSTIA_P/N) ---- */
-	/*
-	 * Switch matrix for current measurement:
-	 *   Dswitch = SWD_CE0   = BIT(4) = 0x10
-	 *   Pswitch = SWP_CE0   = BIT(10) = 0x400
-	 *   Nswitch = SWN_AIN1  = BIT(1) = 0x02
-	 *   Tswitch = SWT_AIN1|SWT_TRTIA = BIT(1)|BIT(8) = 0x102
-	 */
-	SEQ_WR(AD5940_REG_DSWFULLCON, AD5940_SWD_CE0),
-	SEQ_WR(AD5940_REG_PSWFULLCON, AD5940_SWP_CE0),
-	SEQ_WR(AD5940_REG_NSWFULLCON, AD5940_SWN_AIN1),
-	SEQ_WR(AD5940_REG_TSWFULLCON, AD5940_SWT_AIN1 | AD5940_SWT_TRTIA),
-	SEQ_WR(AD5940_REG_SWCON, AD5940_SWCON_SWSOURCESEL),  /* commit */
+/* ADCCON bit masks for MUX fields */
+#define AD5940_ADCCON_MUXSELP_MASK	0x0000003F
+#define AD5940_ADCCON_MUXSELN_MASK	0x00001F00
 
-	/* ADC MUX = HSTIA_P(1) / HSTIA_N(1) → (1<<0)|(1<<8) = 0x0101 */
-	SEQ_WR(AD5940_REG_ADCCON,
-		(AD5940_ADCMUXP_HSTIA_P << AD5940_ADCCON_MUXSELP_SHIFT) |
-		(AD5940_ADCMUXN_HSTIA_N << AD5940_ADCCON_MUXSELN_SHIFT)),
+/* AGPIO pin for sequence debug output */
+#define AD5940_AGPIO_Pin6			BIT(6)
 
-	/* Enable WG + ADC power (analog modules only, no conversion yet) */
-	SEQ_WR(AD5940_REG_AFECON,
-		AD5940_AFECON_HSDACPWR | AD5940_AFECON_EXTBUFPWR |
-		AD5940_AFECON_INAMPPWR | AD5940_AFECON_HSTIAPWR |
-		AD5940_AFECON_DACREFPWR | AD5940_AFECON_SINC2NOTCH |
-		AD5940_AFECON_WG | AD5940_AFECON_ADCPWR),
-
-	/* Wait 50us for signal settling (16*50 = 800) */
-	SEQ_WAIT(800),
-
-	/* Start ADC conversion + DFT */
-	SEQ_WR(AD5940_REG_AFECON,
-		AD5940_AFECON_HSDACPWR | AD5940_AFECON_EXTBUFPWR |
-		AD5940_AFECON_INAMPPWR | AD5940_AFECON_HSTIAPWR |
-		AD5940_AFECON_DACREFPWR | AD5940_AFECON_SINC2NOTCH |
-		AD5940_AFECON_WG | AD5940_AFECON_ADCPWR |
-		AD5940_AFECON_ADCCNV | AD5940_AFECON_DFT),
-
-	/* Wait for DFT completion */
-	SEQ_WAIT(AD5940_BIA_WAIT_CLKS),
-
-	/* Stop ADC conversion + DFT + WG + ADC power */
-	SEQ_WR(AD5940_REG_AFECON,
-		AD5940_AFECON_HSDACPWR | AD5940_AFECON_EXTBUFPWR |
-		AD5940_AFECON_INAMPPWR | AD5940_AFECON_HSTIAPWR |
-		AD5940_AFECON_DACREFPWR | AD5940_AFECON_SINC2NOTCH),
-
-	/* ---- Step 2: Voltage DFT (ADC MUX = AIN3/AIN2) ---- */
-	/* ADC MUX = AIN3(=7) / AIN2(=6) → (7<<0)|(6<<8) = 0x0607 */
-	SEQ_WR(AD5940_REG_ADCCON,
-		(AD5940_ADCMUXP_AIN3 << AD5940_ADCCON_MUXSELP_SHIFT) |
-		(AD5940_ADCMUXN_AIN2 << AD5940_ADCCON_MUXSELN_SHIFT)),
-
-	/* Enable WG + ADC power + start ADC conversion (flush S/H cap) */
-	SEQ_WR(AD5940_REG_AFECON,
-		AD5940_AFECON_HSDACPWR | AD5940_AFECON_EXTBUFPWR |
-		AD5940_AFECON_INAMPPWR | AD5940_AFECON_HSTIAPWR |
-		AD5940_AFECON_DACREFPWR | AD5940_AFECON_SINC2NOTCH |
-		AD5940_AFECON_WG | AD5940_AFECON_ADCPWR |
-		AD5940_AFECON_ADCCNV),
-
-	/* Wait 200us for MUX switch to settle + flush old sample data.
-	 * ADC at 800ksps with SINC3OSR=2 gives ~400k samples/s.
-	 * 200us = ~80 ADC samples, enough to fully flush SINC3 pipeline.
-	 */
-	SEQ_WAIT(3200),
-
-	/* Now start DFT (ADC already converting with new MUX) */
-	SEQ_WR(AD5940_REG_AFECON,
-		AD5940_AFECON_HSDACPWR | AD5940_AFECON_EXTBUFPWR |
-		AD5940_AFECON_INAMPPWR | AD5940_AFECON_HSTIAPWR |
-		AD5940_AFECON_DACREFPWR | AD5940_AFECON_SINC2NOTCH |
-		AD5940_AFECON_WG | AD5940_AFECON_ADCPWR |
-		AD5940_AFECON_ADCCNV | AD5940_AFECON_DFT),
-
-	/* Wait for DFT completion */
-	SEQ_WAIT(AD5940_BIA_WAIT_CLKS),
-
-	/* Stop everything */
-	SEQ_WR(AD5940_REG_AFECON,
-		AD5940_AFECON_HSDACPWR | AD5940_AFECON_EXTBUFPWR |
-		AD5940_AFECON_INAMPPWR | AD5940_AFECON_HSTIAPWR |
-		AD5940_AFECON_DACREFPWR | AD5940_AFECON_SINC2NOTCH),
-
-	/* ---- Step 3: Restore switch matrix to idle (PL/NL closed) ---- */
-	SEQ_WR(AD5940_REG_DSWFULLCON, AD5940_SWD_OPEN),
-	SEQ_WR(AD5940_REG_PSWFULLCON, AD5940_SWP_PL | AD5940_SWP_PL2),
-	SEQ_WR(AD5940_REG_NSWFULLCON, AD5940_SWN_NL | AD5940_SWN_NL2),
-	SEQ_WR(AD5940_REG_TSWFULLCON, AD5940_SWT_TRTIA),
-	SEQ_WR(AD5940_REG_SWCON, AD5940_SWCON_SWSOURCESEL),
-
-	/* GPIO: clear all */
-	SEQ_WR(AD5940_REG_SYNCEXTDEVICE, 0x00),
-
-	/* Put AFE to sleep (EnterSleepS: write 0 then 1 to SEQTRGSLP) */
-	SEQ_SLP(),
-};
+/*
+ * Measure sequence is now generated dynamically using ADI's exact
+ * high-level API flow (AppBIASeqMeasureGen). See ad5940_core.c.
+ * The generated commands are written directly to SRAM.
+ */
 
 /* ================================================================== */
 /*  struct ad5940_priv - driver private data                          */
@@ -779,6 +548,17 @@ struct ad5940_priv {
 
 	/* Pointer back to the IIO device (for use in trigger ops) */
 	struct iio_dev		*iio_dev;
+
+	/*
+	 * Measurement state tracking.
+	 * running: true when WUPT is active and measurements are in progress.
+	 * irq_disabled: tracks whether our hard IRQ handler has called
+	 *   disable_irq_nosync() without a matching enable_irq().  Needed
+	 *   because the IIO trigger re-enable callback may not fire if the
+	 *   buffer is disabled while a trigger handler is pending.
+	 */
+	bool			running;
+	bool			irq_disabled;
 };
 
 /* ---- Core register access API ---- */
