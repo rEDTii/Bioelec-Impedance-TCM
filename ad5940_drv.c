@@ -94,8 +94,10 @@ MODULE_PARM_DESC(sweep_points, "Number of sweep frequency points (default: 10)")
 #define AD5940_DFT_CURR_IMAG	1
 #define AD5940_DFT_VOLT_REAL	2
 #define AD5940_DFT_VOLT_IMAG	3
-#define AD5940_DFT_FREQ		4
-#define AD5940_DFT_TIMESTAMP	5
+#define AD5940_DFT_FREQ			4
+#define AD5940_DFT_RTIA_MAG		5
+#define AD5940_DFT_RTIA_PHASE	6
+#define AD5940_DFT_TIMESTAMP	7
 
 static const struct iio_chan_spec ad5940_dft_channels[] = {
 	[AD5940_DFT_CURR_REAL] = {
@@ -157,6 +159,32 @@ static const struct iio_chan_spec ad5940_dft_channels[] = {
 		.scan_index		= AD5940_DFT_FREQ,
 		.scan_type		= {
 			.sign		= 'u',
+			.realbits	= 32,
+			.storagebits	= 32,
+			.shift		= 0,
+			.endianness	= IIO_CPU,
+		},
+	},
+	[AD5940_DFT_RTIA_MAG] = {
+		.type			= IIO_RESISTANCE,
+		.indexed		= 1,
+		.channel		= 0,
+		.scan_index		= AD5940_DFT_RTIA_MAG,
+		.scan_type		= {
+			.sign		= 's',
+			.realbits	= 64,
+			.storagebits	= 64,
+			.shift		= 0,
+			.endianness	= IIO_CPU,
+		},
+	},
+	[AD5940_DFT_RTIA_PHASE] = {
+		.type			= IIO_PHASE,
+		.indexed		= 1,
+		.channel		= 0,
+		.scan_index		= AD5940_DFT_RTIA_PHASE,
+		.scan_type		= {
+			.sign		= 's',
 			.realbits	= 32,
 			.storagebits	= 32,
 			.shift		= 0,
@@ -235,15 +263,31 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	struct ad5940_priv *priv = iio_priv(indio_dev);
 
 	/*
-	 * Buffer layout for iio_push_to_buffers_with_timestamp():
-	 *   4 × u32 DFT data + 1 × u32 frequency  +  1 × s64 timestamp
-	 * The timestamp is appended after channel data by the framework,
-	 * so we must reserve space for it to avoid stack overflow.
+	 * IIO scan buffer layout (must match iio_compute_scan_bytes):
+	 * IIO requires s64 channels to be 8-byte aligned.
+	 *   Offset 0-15:   4 × u32  DFT current/voltage
+	 *   Offset 16-19:  1 × u32  excitation frequency
+	 *   Offset 20-23:  4 bytes  alignment padding (for s64 RTIA mag)
+	 *   Offset 24-31:  1 × s64  RTIA magnitude (milliohms)
+	 *   Offset 32-35:  1 × s32  RTIA phase (millidegrees)
+	 *   Offset 36-39:  4 bytes  alignment padding (for s64 timestamp)
+	 *   Offset 40-47:  1 × s64  timestamp (written by IIO framework)
+	 *
+	 * scan_bytes = 48; driver provides first 40 bytes of channel data,
+	 * IIO framework writes timestamp at offset 40.
 	 */
-	u32 buf[AD5940_DFT_CHANNELS + sizeof(s64) / sizeof(u32)];
+	struct ad5940_scan_buf {
+		u32 dft[4];       /* offset  0: DFT current/voltage */
+		u32 freq;         /* offset 16: excitation frequency */
+		u32 _pad0;        /* offset 20: alignment padding for s64 */
+		s64 rtia_mag;     /* offset 24: RTIA magnitude (milliohms) */
+		s32 rtia_phase;   /* offset 32: RTIA phase (millidegrees) */
+		s32 _pad1;        /* offset 36: alignment padding for timestamp */
+		s64 timestamp;    /* offset 40: filled by iio_push_to_buffers_with_timestamp */
+	} scan;
 	int ret, fifo_cnt, read_cnt, frames, frame;
 
-	memset(buf, 0, sizeof(buf));
+	memset(&scan, 0, sizeof(scan));
 
 	/* Wake up AFE (it may be in hibernate between measurements) */
 	ret = ad5940_wakeup(priv);
@@ -398,7 +442,8 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	 */
 	frames = read_cnt / AD5940_FIFO_WORDS_PER_FRAME;
 	for (frame = 0; frame < frames; frame++) {
-		ret = ad5940_fifo_read(priv, buf, AD5940_FIFO_WORDS_PER_FRAME);
+		ret = ad5940_fifo_read(priv, scan.dft,
+				       AD5940_FIFO_WORDS_PER_FRAME);
 		if (ret) {
 			dev_err(&priv->spi->dev,
 				"FIFO read failed at frame %d/%d: %d\n",
@@ -407,9 +452,18 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 		}
 
 		/* Fill frequency channel with current measurement frequency */
-		buf[AD5940_DFT_FREQ] = priv->freq_of_data_hz;
+		scan.freq = priv->freq_of_data_hz;
 
-		iio_push_to_buffers_with_timestamp(indio_dev, buf,
+		/*
+		 * Fill RTIA calibration channels with the active cal values
+		 * for this measurement frequency.  RTIA magnitude is s64
+		 * (milliohms), RTIA phase is s32 (millidegrees).
+		 * Struct fields are at IIO-aligned offsets (no overlap).
+		 */
+		scan.rtia_mag = priv->rtia_cal.magnitude_mohm;
+		scan.rtia_phase = priv->rtia_cal.phase_mdeg;
+
+		iio_push_to_buffers_with_timestamp(indio_dev, &scan,
 						   iio_get_time_ns(indio_dev));
 
 		/* Advance sweep state and update WGFCW for next cycle */

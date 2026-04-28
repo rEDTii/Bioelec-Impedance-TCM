@@ -413,7 +413,7 @@
 #define AD5940_WAKEUP_RETRIES	10
 #define AD5940_FIFO_THRESHOLD		4
 #define AD5940_FIFO_WORDS_PER_FRAME	4	/* FIFO words per DFT measurement cycle */
-#define AD5940_DFT_CHANNELS		5	/* IIO scan channels: 4 DFT + 1 frequency */
+#define AD5940_DFT_CHANNELS		7	/* IIO scan channels: 4 DFT + 1 freq + 2 RTIA */
 #define AD5940_MAX_SWEEP_POINTS		100
 
 /*

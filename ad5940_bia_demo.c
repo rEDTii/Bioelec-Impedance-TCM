@@ -59,9 +59,9 @@
  */
 #define RTIA_NOMINAL_OHM	1000.0f
 
-/* Each measurement cycle produces 4 FIFO words + 1 frequency word */
+/* Each measurement cycle produces 4 FIFO words + 1 frequency + 2 RTIA */
 #define NUM_DFT_CHANNELS	4
-#define NUM_CHANNELS		5
+#define NUM_CHANNELS		7
 
 /* ------------------------------------------------------------------ */
 /*  DFT data parsing helpers                                          */
@@ -103,12 +103,15 @@ typedef struct {
  *   VoltPhase = atan2(-Vi, Vr)      // Note: ADI negates imaginary
  *   CurrMag   = sqrt(Ir^2 + Ii^2)
  *   CurrPhase = atan2(-Ii, Ir)
- *   |Z|       = VoltMag / CurrMag * Rtia
- *   angle(Z)  = VoltPhase - CurrPhase
+ *   |Z|       = VoltMag / CurrMag * RtiaCal.magnitude
+ *   angle(Z)  = VoltPhase - CurrPhase + RtiaCal.phase
+ *
+ * Rtia magnitude is in milliohms, phase in millidegrees (from driver).
  */
 static void compute_impedance(int32_t curr_real, int32_t curr_imag,
 			      int32_t volt_real, int32_t volt_imag,
-			      float rtia, bia_impedance_t *result)
+			      float rtia_mag_ohm, float rtia_phase_deg,
+			      bia_impedance_t *result)
 {
 	float vr = (float)volt_real;
 	float vi = (float)volt_imag;
@@ -128,8 +131,9 @@ static void compute_impedance(int32_t curr_real, int32_t curr_imag,
 		return;
 	}
 
-	float z_mag   = volt_mag / curr_mag * rtia;
-	float z_phase = volt_phase - curr_phase;
+	float z_mag   = volt_mag / curr_mag * rtia_mag_ohm;
+	float z_phase = volt_phase - curr_phase
+		      + rtia_phase_deg * (float)M_PI / 180.0f;
 
 	float z_phase_deg = z_phase * 180.0f / (float)M_PI;
 
@@ -214,6 +218,8 @@ int main(int argc, char *argv[])
 	ch[2] = iio_device_find_channel(dev, "voltage0", false);
 	ch[3] = iio_device_find_channel(dev, "voltage1", false);
 	ch[4] = iio_device_find_channel(dev, "altvoltage0", false);
+	ch[5] = iio_device_find_channel(dev, "resistance0", false);
+	ch[6] = iio_device_find_channel(dev, "phase0", false);
 
 	for (int i = 0; i < NUM_CHANNELS; i++) {
 		if (!ch[i]) {
@@ -259,13 +265,12 @@ int main(int argc, char *argv[])
 
 	printf("\nCollecting %s samples (Ctrl-C to stop)...\n",
 	       max_samples ? "up to N" : "continuous");
-	printf("Rtia = %.0f Ohm (nominal), Frequency from driver\n\n",
-	       RTIA_NOMINAL_OHM);
-	printf("%-6s %10s %12s %12s %12s %12s %12s %12s  %s\n",
+	printf("RTIA calibrated, Frequency from driver\n\n");
+	printf("%-6s %10s %12s %12s %12s %12s %12s %12s %10s %10s  %s\n",
 	       "#", "Freq(Hz)", "|Z|(Ohm)", "Phase(deg)", "R(Ohm)", "X(Ohm)",
-	       "CurrMag", "VoltMag", "CurrDFT(R/I) VoltDFT(R/I)");
+	       "CurrMag", "VoltMag", "Rtia(Ohm)", "RtiaPh(d)", "CurrDFT(R/I) VoltDFT(R/I)");
 	printf("------ ---------- ------------ ------------ ------------ ------------ "
-	       "------------ ------------  -----------------------\n");
+	       "------------ ------------ ---------- ----------  -----------------------\n");
 
 	/* ---- Main data acquisition loop ---- */
 	while (keep_running) {
@@ -287,11 +292,16 @@ int main(int argc, char *argv[])
 
 		/*
 		 * Extract raw channel data using iio_channel_read().
-		 * raw=true: read samples in hardware format (18-bit in 32-bit word),
+		 * raw=true: read samples in hardware format,
 		 *           no scale/offset conversion by libiio.
+		 * Channels 0-4 are 32-bit, channel 5 (RTIA mag) is 64-bit,
+		 * channel 6 (RTIA phase) is 32-bit.
 		 */
 		int32_t raw[NUM_CHANNELS];
-		for (int i = 0; i < NUM_CHANNELS; i++) {
+		int64_t raw_rtia_mag;
+		int32_t raw_rtia_phase;
+
+		for (int i = 0; i < 5; i++) {
 			size_t nr = iio_channel_read(ch[i], block,
 						     &raw[i], sizeof(int32_t),
 						     true);
@@ -301,6 +311,12 @@ int main(int argc, char *argv[])
 				break;
 			}
 		}
+		/* RTIA magnitude: s64 milliohms */
+		iio_channel_read(ch[5], block, &raw_rtia_mag,
+				 sizeof(int64_t), true);
+		/* RTIA phase: s32 millidegrees */
+		iio_channel_read(ch[6], block, &raw_rtia_phase,
+				 sizeof(int32_t), true);
 
 		/* Sign-extend 18-bit DFT values */
 		int32_t curr_real = sign_extend_18bit((uint32_t)raw[0]);
@@ -311,11 +327,15 @@ int main(int argc, char *argv[])
 		/* Frequency channel: unsigned 32-bit Hz value from driver */
 		uint32_t freq_hz = (uint32_t)raw[4];
 
-		/* Compute impedance */
+		/* RTIA calibrated values from driver */
+		float rtia_mag_ohm = (float)raw_rtia_mag / 1000.0f;
+		float rtia_phase_deg = (float)raw_rtia_phase / 1000.0f;
+
+		/* Compute impedance with calibrated RTIA */
 		bia_impedance_t z;
 		compute_impedance(curr_real, curr_imag,
 				  volt_real, volt_imag,
-				  RTIA_NOMINAL_OHM, &z);
+				  rtia_mag_ohm, rtia_phase_deg, &z);
 
 		/* Diagnostic magnitudes */
 		float curr_mag = sqrtf((float)curr_real * curr_real +
@@ -324,11 +344,12 @@ int main(int argc, char *argv[])
 				       (float)volt_imag * volt_imag);
 
 		sample_count++;
-		printf("%-6d %10u %12.2f %12.2f %12.2f %12.2f %12.1f %12.1f  "
+		printf("%-6d %10u %12.2f %12.2f %12.2f %12.2f %12.1f %12.1f %10.2f %10.2f  "
 		       "(%d/%d) (%d/%d)\n",
 		       sample_count, freq_hz, z.magnitude, z.phase,
 		       z.resistance, z.reactance,
 		       curr_mag, volt_mag,
+		       rtia_mag_ohm, rtia_phase_deg,
 		       curr_real, curr_imag, volt_real, volt_imag);
 
 		if (max_samples > 0 && sample_count >= max_samples)
@@ -338,8 +359,7 @@ int main(int argc, char *argv[])
 	printf("\n--- Summary ---\n");
 	printf("Samples collected: %d\n", sample_count);
 	if (sample_count > 0)
-		printf("Rtia = %.0f Ohm (nominal, uncalibrated)\n",
-		       RTIA_NOMINAL_OHM);
+		printf("RTIA calibrated (values from driver)\n");
 
 cleanup:
 	if (stream)
