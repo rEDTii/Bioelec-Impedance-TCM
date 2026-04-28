@@ -42,6 +42,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <iio.h>
 
 /* ------------------------------------------------------------------ */
@@ -93,7 +96,8 @@ typedef struct {
 	float phase;		/* angle(Z) in degrees */
 	float resistance;	/* Real part R in Ohms */
 	float reactance;	/* Imaginary part X in Ohms */
-} bia_impedance_t;
+	uint32_t freq_hz;	/* Excitation frequency in Hz */
+} bia_sample_t;
 
 /*
  * compute_impedance — Calculate impedance from DFT voltage and current
@@ -111,7 +115,8 @@ typedef struct {
 static void compute_impedance(int32_t curr_real, int32_t curr_imag,
 			      int32_t volt_real, int32_t volt_imag,
 			      float rtia_mag_ohm, float rtia_phase_deg,
-			      bia_impedance_t *result)
+			      uint32_t freq_hz,
+			      bia_sample_t *result)
 {
 	float vr = (float)volt_real;
 	float vi = (float)volt_imag;
@@ -141,6 +146,7 @@ static void compute_impedance(int32_t curr_real, int32_t curr_imag,
 	result->phase      = z_phase_deg;
 	result->resistance = z_mag * cosf(z_phase);
 	result->reactance  = z_mag * sinf(z_phase);
+	result->freq_hz    = freq_hz;
 }
 
 /* ------------------------------------------------------------------ */
@@ -156,6 +162,118 @@ static void sigint_handler(int sig)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Ring buffer + communication thread                                */
+/* ------------------------------------------------------------------ */
+
+#define RING_BUF_SIZE		16	/* power of 2 for fast modulo */
+
+/* Unix DGRAM socket path — must match dummy_Qt */
+#define BIA_SOCK_PATH		"/tmp/bia_sample.sock"
+
+typedef struct {
+	bia_sample_t	buf[RING_BUF_SIZE];
+	int		head;		/* next write position */
+	int		tail;		/* next read position */
+	int		count;		/* number of occupied slots */
+	pthread_mutex_t	mutex;
+	pthread_cond_t	cond;
+} ring_buffer_t;
+
+static ring_buffer_t g_ring = {
+	.mutex  = PTHREAD_MUTEX_INITIALIZER,
+	.cond   = PTHREAD_COND_INITIALIZER,
+};
+
+static void ring_push(ring_buffer_t *rb, const bia_sample_t *sample)
+{
+	pthread_mutex_lock(&rb->mutex);
+
+	/* Overwrite oldest if full (consumer too slow) */
+	if (rb->count == RING_BUF_SIZE) {
+		rb->tail = (rb->tail + 1) % RING_BUF_SIZE;
+		rb->count--;
+	}
+
+	rb->buf[rb->head] = *sample;
+	rb->head = (rb->head + 1) % RING_BUF_SIZE;
+	rb->count++;
+
+	pthread_cond_signal(&rb->cond);
+	pthread_mutex_unlock(&rb->mutex);
+}
+
+static int ring_pop(ring_buffer_t *rb, bia_sample_t *sample)
+{
+	pthread_mutex_lock(&rb->mutex);
+
+	while (rb->count == 0 && keep_running)
+		pthread_cond_wait(&rb->cond, &rb->mutex);
+
+	if (rb->count == 0) {
+		pthread_mutex_unlock(&rb->mutex);
+		return -1;	/* shutdown, no data */
+	}
+
+	*sample = rb->buf[rb->tail];
+	rb->tail = (rb->tail + 1) % RING_BUF_SIZE;
+	rb->count--;
+
+	pthread_mutex_unlock(&rb->mutex);
+	return 0;
+}
+
+/*
+ * comm_thread_fn — Communication thread: pops samples and sends them
+ * over a Unix DGRAM socket to the Qt process (or dummy_Qt).
+ */
+static void *comm_thread_fn(void *arg)
+{
+	bia_sample_t sample;
+	int seq = 0;
+	int fd = -1;
+	struct sockaddr_un addr;
+
+	(void)arg;
+
+	/* Create Unix DGRAM socket */
+	fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		fprintf(stderr, "[comm] ERROR: socket(): %s\n", strerror(errno));
+		return NULL;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, BIA_SOCK_PATH, sizeof(addr.sun_path) - 1);
+
+	printf("[comm] Communication thread started (sending to %s)\n",
+	       BIA_SOCK_PATH);
+
+	while (keep_running) {
+		if (ring_pop(&g_ring, &sample) < 0)
+			break;
+
+		seq++;
+
+		/* Send raw bia_sample_t as one datagram */
+		ssize_t n = sendto(fd, &sample, sizeof(sample), 0,
+				   (struct sockaddr *)&addr, sizeof(addr));
+		if (n < 0) {
+			fprintf(stderr, "[comm] sendto failed (#%d): %s\n",
+				seq, strerror(errno));
+		} else if (n != sizeof(sample)) {
+			fprintf(stderr, "[comm] sendto partial: %zd/%zu\n",
+				n, sizeof(sample));
+		}
+	}
+
+	if (fd >= 0)
+		close(fd);
+	printf("[comm] Communication thread exiting (%d samples sent)\n", seq);
+	return NULL;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Main program                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -168,9 +286,11 @@ int main(int argc, char *argv[])
 	struct iio_channels_mask *mask = NULL;
 	struct iio_stream  *stream = NULL;
 
-	int max_samples = 100;
+	int max_samples = 0;	/* 0 = run forever until signal */
 	int sample_count = 0;
 	int ret = 0;
+	bool comm_started = false;
+	pthread_t comm_thread;
 
 	if (argc > 1) {
 		max_samples = atoi(argv[1]);
@@ -263,14 +383,24 @@ int main(int argc, char *argv[])
 		goto cleanup;
 	}
 
-	printf("\nCollecting %s samples (Ctrl-C to stop)...\n",
-	       max_samples ? "up to N" : "continuous");
-	printf("RTIA calibrated, Frequency from driver\n\n");
-	printf("%-6s %10s %12s %12s %12s %12s %12s %12s %10s %10s  %s\n",
-	       "#", "Freq(Hz)", "|Z|(Ohm)", "Phase(deg)", "R(Ohm)", "X(Ohm)",
-	       "CurrMag", "VoltMag", "Rtia(Ohm)", "RtiaPh(d)", "CurrDFT(R/I) VoltDFT(R/I)");
-	printf("------ ---------- ------------ ------------ ------------ ------------ "
-	       "------------ ------------ ---------- ----------  -----------------------\n");
+	// printf("\nCollecting %s samples (Ctrl-C to stop)...\n",
+	//        max_samples ? "up to N" : "continuous");
+	// printf("RTIA calibrated, Frequency from driver\n\n");
+	// printf("%-6s %10s %12s %12s %12s %12s %12s %12s %10s %10s  %s\n",
+	//        "#", "Freq(Hz)", "|Z|(Ohm)", "Phase(deg)", "R(Ohm)", "X(Ohm)",
+	//        "CurrMag", "VoltMag", "Rtia(Ohm)", "RtiaPh(d)", "CurrDFT(R/I) VoltDFT(R/I)");
+	// printf("------ ---------- ------------ ------------ ------------ ------------ "
+	//        "------------ ------------ ---------- ----------  -----------------------\n");
+
+	/* ---- Start communication thread ---- */
+	ret = pthread_create(&comm_thread, NULL, comm_thread_fn, NULL);
+	if (ret) {
+		fprintf(stderr, "ERROR: Cannot create comm thread: %s\n",
+			strerror(ret));
+		ret = 1;
+		goto cleanup;
+	}
+	comm_started = true;
 
 	/* ---- Main data acquisition loop ---- */
 	while (keep_running) {
@@ -332,10 +462,11 @@ int main(int argc, char *argv[])
 		float rtia_phase_deg = (float)raw_rtia_phase / 1000.0f;
 
 		/* Compute impedance with calibrated RTIA */
-		bia_impedance_t z;
+		bia_sample_t sample;
 		compute_impedance(curr_real, curr_imag,
 				  volt_real, volt_imag,
-				  rtia_mag_ohm, rtia_phase_deg, &z);
+				  rtia_mag_ohm, rtia_phase_deg,
+				  freq_hz, &sample);
 
 		/* Diagnostic magnitudes */
 		float curr_mag = sqrtf((float)curr_real * curr_real +
@@ -344,13 +475,16 @@ int main(int argc, char *argv[])
 				       (float)volt_imag * volt_imag);
 
 		sample_count++;
-		printf("%-6d %10u %12.2f %12.2f %12.2f %12.2f %12.1f %12.1f %10.2f %10.2f  "
-		       "(%d/%d) (%d/%d)\n",
-		       sample_count, freq_hz, z.magnitude, z.phase,
-		       z.resistance, z.reactance,
-		       curr_mag, volt_mag,
-		       rtia_mag_ohm, rtia_phase_deg,
-		       curr_real, curr_imag, volt_real, volt_imag);
+		// printf("%-6d %10u %12.2f %12.2f %12.2f %12.2f %12.1f %12.1f %10.2f %10.2f  "
+		//        "(%d/%d) (%d/%d)\n",
+		//        sample_count, freq_hz, sample.magnitude, sample.phase,
+		//        sample.resistance, sample.reactance,
+		//        curr_mag, volt_mag,
+		//        rtia_mag_ohm, rtia_phase_deg,
+		//        curr_real, curr_imag, volt_real, volt_imag);
+
+		/* Push to ring buffer for communication thread */
+		ring_push(&g_ring, &sample);
 
 		if (max_samples > 0 && sample_count >= max_samples)
 			break;
@@ -360,6 +494,14 @@ int main(int argc, char *argv[])
 	printf("Samples collected: %d\n", sample_count);
 	if (sample_count > 0)
 		printf("RTIA calibrated (values from driver)\n");
+
+	/* Wake comm thread so it can exit */
+	pthread_mutex_lock(&g_ring.mutex);
+	pthread_cond_signal(&g_ring.cond);
+	pthread_mutex_unlock(&g_ring.mutex);
+
+	if (comm_started)
+		pthread_join(comm_thread, NULL);
 
 cleanup:
 	if (stream)
