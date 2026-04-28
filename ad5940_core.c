@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/spi/spi.h>
 #include <linux/delay.h>
+#include <asm/unaligned.h>
 #include "ad5940_core.h"
 
 /* ------------------------------------------------------------------ */
@@ -179,37 +180,114 @@ EXPORT_SYMBOL_GPL(ad5940_spi_read32);
  * @buf: output buffer (must have room for @count u32 words)
  * @count: number of FIFO words to read
  *
- * Uses ADI's recommended "small readcount" method: set address to
- * REG_AFE_DATAFIFORD once, then issue repeated READREG commands.
- * Each read automatically pops the next word from the FIFO.
+ * Uses AD5940's SPICMD_READFIFO (0x5F) for continuous burst read.
+ * This is the protocol used by ADI's FIFORd() when count >= 3:
+ *
+ *   CS↓ [READFIFO] [6×dummy] [data×(count-2)] [data+0x44444444×2] CS↑
+ *
+ * The first 2 words after the 6 dummy bytes are invalid (discarded).
+ * The last 2 words require a non-zero write offset (0x44444444) to
+ * advance the FIFO read pointer correctly.
+ *
+ * When count < 3, falls back to the SETADDR + per-word READREG
+ * method (which does not require the dummy/offset protocol).
+ * When count > AD5940_FIFO_MAX_WORDS, count is clamped to that limit.
  *
  * Return: 0 on success, negative errno on failure
  */
 int ad5940_fifo_read(struct ad5940_priv *priv, u32 *buf, int count)
 {
-	u8 tx[6], rx[6];
-	int ret, i;
+	struct spi_message msg;
+	struct spi_transfer xfer;
+	int ret, i, total_len, last_off;
+	u8 *tx_buf, *rx_buf;
+	const u8 *data;
 
-	/* Phase 1: set address to FIFO data register */
-	tx[0] = AD5940_SPI_CMD_SETADDR;
-	tx[1] = (AD5940_REG_FIFODATA >> 8) & 0xff;
-	tx[2] = AD5940_REG_FIFODATA & 0xff;
-	ret = ad5940_spi_xfer(priv, tx, rx, 3);
-	if (ret)
-		return ret;
+	if (count < 3) {
+		/*
+		 * Small readcount path: SETADDR + per-word READREG.
+		 * This matches ADI's FIFORd() for count < 3.
+		 */
+		u8 tx[6], rx[6];
 
-	/* Phase 2: read 'count' words from FIFO (32-bit register) */
-	for (i = 0; i < count; i++) {
-		memset(tx, 0, 6);
-		tx[0] = AD5940_SPI_CMD_READREG;
-		ret = ad5940_spi_xfer(priv, tx, rx, 6);
+		/* Phase 1: set address to FIFO data register */
+		tx[0] = AD5940_SPI_CMD_SETADDR;
+		tx[1] = (AD5940_REG_FIFODATA >> 8) & 0xff;
+		tx[2] = AD5940_REG_FIFODATA & 0xff;
+		ret = ad5940_spi_xfer(priv, tx, rx, 3);
 		if (ret)
 			return ret;
-		buf[i] = (rx[2] << 24) | (rx[3] << 16) |
-			  (rx[4] << 8)  | rx[5];
+
+		/* Phase 2: read 'count' words from FIFO (32-bit register) */
+		for (i = 0; i < count; i++) {
+			memset(tx, 0, 6);
+			tx[0] = AD5940_SPI_CMD_READREG;
+			ret = ad5940_spi_xfer(priv, tx, rx, 6);
+			if (ret)
+				return ret;
+			buf[i] = (rx[2] << 24) | (rx[3] << 16) |
+				  (rx[4] << 8)  | rx[5];
+		}
+		return 0;
 	}
 
-	return 0;
+	if (count > AD5940_FIFO_MAX_WORDS)
+		count = AD5940_FIFO_MAX_WORDS;
+
+	/*
+	 * READFIFO burst read path (3 <= count <= AD5940_FIFO_MAX_WORDS):
+	 *
+	 * SPI frame layout:
+	 *   Byte 0:     READFIFO command (0x5F)
+	 *   Bytes 1-6:  dummy (6 bytes, first 2 FIFO words are invalid)
+	 *   Then count words of data, each 4 bytes, big-endian.
+	 *   Last 2 words: TX must send 0x44444444 offset to advance
+	 *                 the FIFO read pointer.
+	 *
+	 * Total transfer length: 1 + 6 + count * 4
+	 */
+	total_len = 1 + 6 + count * 4;
+
+	tx_buf = kzalloc(total_len, GFP_KERNEL);
+	rx_buf = kzalloc(total_len, GFP_KERNEL);
+	if (!tx_buf || !rx_buf) {
+		kfree(tx_buf);
+		kfree(rx_buf);
+		return -ENOMEM;
+	}
+
+	tx_buf[0] = AD5940_SPI_CMD_READFIFO;
+	last_off = 1 + 6 + (count - 2) * 4;
+	// 非对齐内存 + 大端序写入 避免非对齐访问崩溃
+	put_unaligned_be32(0x44444444, &tx_buf[last_off]);
+	put_unaligned_be32(0x44444444, &tx_buf[last_off + 4]);
+
+	spi_message_init(&msg);
+	memset(&xfer, 0, sizeof(xfer));
+	xfer.tx_buf = tx_buf;
+	xfer.rx_buf = rx_buf;
+	xfer.len = total_len;
+	spi_message_add_tail(&xfer, &msg);
+
+	ret = spi_sync(priv->spi, &msg);
+
+	if (!ret) {
+		/*
+		 * Parse received data: skip 7-byte header (1 CMD + 6 dummy),
+		 * then extract count big-endian u32 words.
+		 */
+		data = rx_buf;
+		for (i = 0; i < count; i++) {
+			int off = 7 + i * 4;
+			buf[i] = (data[off] << 24)     | (data[off + 1] << 16) |
+				  (data[off + 2] << 8) | data[off + 3];
+		}
+	}
+
+	kfree(tx_buf);
+	kfree(rx_buf);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(ad5940_fifo_read);
 

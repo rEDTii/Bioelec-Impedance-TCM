@@ -417,6 +417,13 @@
 #define AD5940_MAX_SWEEP_POINTS		100
 
 /*
+ * READFIFO burst read limit.
+ * Reads with count > AD5940_FIFO_MAX_WORDS fall back to per-word READREG.
+ * READFIFO protocol overhead: 1 CMD + 6 dummy = 7 bytes.
+ */
+#define AD5940_FIFO_MAX_WORDS		32
+
+/*
  * BIA ODR and WUPT clock frequency.
  *
  * ADI sets BiaODR=20 in AD5940BIAStructInit, but AppBIASeqMeasureGen()

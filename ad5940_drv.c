@@ -45,21 +45,21 @@
 /*  Module parameters for frequency sweep configuration                */
 /* ------------------------------------------------------------------ */
 
-static bool sweep_en;
+static bool sweep_en = true;
 module_param(sweep_en, bool, 0644);
-MODULE_PARM_DESC(sweep_en, "Enable frequency sweep (default: 0)");
+MODULE_PARM_DESC(sweep_en, "Enable frequency sweep (default: 1)");
 
 static uint sweep_start_hz = 10000;
 module_param(sweep_start_hz, uint, 0644);
 MODULE_PARM_DESC(sweep_start_hz, "Sweep start frequency in Hz (default: 10000)");
 
-static uint sweep_stop_hz = 150000;
+static uint sweep_stop_hz = 100000;
 module_param(sweep_stop_hz, uint, 0644);
-MODULE_PARM_DESC(sweep_stop_hz, "Sweep stop frequency in Hz (default: 150000)");
+MODULE_PARM_DESC(sweep_stop_hz, "Sweep stop frequency in Hz (default: 100000)");
 
-static uint sweep_points = 100;
+static uint sweep_points = 10;
 module_param(sweep_points, uint, 0644);
-MODULE_PARM_DESC(sweep_points, "Number of sweep frequency points (default: 100)");
+MODULE_PARM_DESC(sweep_points, "Number of sweep frequency points (default: 10)");
 
 /* ------------------------------------------------------------------ */
 /*  IIO channel definitions – DFT impedance mode (BIA 4-wire)        */
@@ -557,8 +557,9 @@ static int ad5940_probe(struct spi_device *spi)
 	priv->sweep_type = AD5940_SWEEP_LINEAR;
 	priv->sweep_start_hz = sweep_start_hz;
 	priv->sweep_stop_hz = sweep_stop_hz;
+	/* 钳位(clamp): 将 sweep_points 限制在 [1, AD5940_MAX_SWEEP_POINTS] 范围内 */
 	priv->sweep_points = clamp_val(sweep_points, 1,
-				       AD5940_MAX_SWEEP_POINTS);
+				       AD5940_MAX_SWEEP_POINTS); 
 	if (priv->sweep_en) {
 		dev_info(dev, "Sweep: %uHz - %uHz, %u points, linear\n",
 			 priv->sweep_start_hz, priv->sweep_stop_hz,
