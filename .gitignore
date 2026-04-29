@@ -1,0 +1,19 @@
+# Kernel module build artifacts
+*.ko
+*.o
+*.mod.c
+*.mod.o
+*.cmd
+*.order
+Module.symvers
+.tmp_versions/
+.modules/
+
+# User-space executables (cross-compiled for aarch64)
+ad5940_bia_demo
+dummy_Qt
+
+# Object files and debug symbols
+*.d
+*.su
+*.symvers
