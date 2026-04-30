@@ -10,7 +10,6 @@
 
 #include <QDebug>
 #include <QVBoxLayout>
-#include <QTimer>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -22,11 +21,6 @@ MainWindow::MainWindow(QWidget *parent)
 
     initChart();
     initSocket();
-
-    /* Refresh chart every 300 ms, decoupled from data arrival */
-    m_timer = new QTimer(this);
-    connect(m_timer, &QTimer::timeout, this, &MainWindow::refreshChart);
-    m_timer->start(300);
 }
 
 MainWindow::~MainWindow()
@@ -135,7 +129,7 @@ void MainWindow::initSocket()
     int rcvbuf = 65536;
     setsockopt(m_dataFd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-    /* Non-blocking: recvfrom returns EAGAIN when empty, event loop stays alive */
+    /* Non-blocking: recvfrom returns EAGAIN when empty */
     int flags = fcntl(m_dataFd, F_GETFL, 0);
     fcntl(m_dataFd, F_SETFL, flags | O_NONBLOCK);
 
@@ -147,13 +141,18 @@ void MainWindow::initSocket()
 }
 
 /* ------------------------------------------------------------------ */
-/*  Data receive — ONLY stores data, never touches chart              */
+/*  Data receive + immediate refresh                                   */
+/*  Socket is non-blocking, so this never stalls the event loop.      */
+/*  Each QSocketNotifier activation drains all pending datagrams,      */
+/*  then refreshes chart once — real-time, no timer needed.            */
 /* ------------------------------------------------------------------ */
 
 void MainWindow::onDataReady()
 {
     bia_sample_t sample;
+    bool gotData = false;
 
+    /* Drain all available datagrams (non-blocking) */
     while (true) {
         ssize_t n = recvfrom(m_dataFd, &sample, sizeof(sample), 0,
                               NULL, NULL);
@@ -172,23 +171,24 @@ void MainWindow::onDataReady()
         }
 
         m_samples[sample.freq_hz] = sample;
-        m_dirty = true;
+        gotData = true;
 
         qDebug("Freq=%6u Hz  |Z|=%10.2f Ω  Phase=%8.2f °",
                sample.freq_hz, sample.magnitude, sample.phase);
     }
+
+    if (gotData)
+        refreshChart();
 }
 
 /* ------------------------------------------------------------------ */
-/*  Periodic chart refresh (called by QTimer)                         */
+/*  Chart refresh — rebuild series from m_samples                      */
 /* ------------------------------------------------------------------ */
 
 void MainWindow::refreshChart()
 {
-    if (!m_dirty || m_samples.isEmpty())
+    if (m_samples.isEmpty())
         return;
-
-    m_dirty = false;
 
     /* ---- Rebuild magnitude series ---- */
     m_chart->removeSeries(m_magSeries);
@@ -231,7 +231,6 @@ void MainWindow::refreshChart()
     m_chart->addSeries(m_magSeries);
     m_chart->addSeries(m_phaseSeries);
 
-    /* Re-attach axes to new series */
     m_magSeries->attachAxis(m_xAxis);
     m_magSeries->attachAxis(m_yMagAxis);
     m_phaseSeries->attachAxis(m_xAxis);
@@ -240,16 +239,11 @@ void MainWindow::refreshChart()
     /* Auto-adjust axes */
     m_xAxis->setRange(freqMin * 0.8, freqMax * 1.25);
 
-    double magPad = qMax((magMax - magMin) * 0.1, 1.0);
-    m_yMagAxis->setRange(qMax(0.0, magMin - magPad), magMax + magPad);
+    /* |Z| Y-axis: min=0 fixed, max=dynamic with 5% padding */
+    m_yMagAxis->setRange(0, magMax * 1.05);
 
-    double phPad = qMax((phMax - phMin) * 0.1, 5.0);
-    m_yPhaseAxis->setRange(phMin - phPad, phMax + phPad);
+    /* Phase Y-axis: fixed -90 to 90 */
+    m_yPhaseAxis->setRange(-90, 90);
 
     m_chartView->update();
-
-    qDebug("refreshChart: %d points, X=[%.0f,%.0f], |Z|=[%.1f,%.1f], Phase=[%.2f,%.2f]",
-           m_magSeries->count(), freqMin, freqMax,
-           qMax(0.0, magMin - magPad), magMax + magPad,
-           phMin - phPad, phMax + phPad);
 }

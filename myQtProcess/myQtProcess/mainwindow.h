@@ -4,7 +4,6 @@
 #include <QMainWindow>
 #include <QSocketNotifier>
 #include <QMap>
-#include <QTimer>
 #include <QtCharts/QChartView>
 #include <QtCharts/QChart>
 #include <QtCharts/QLineSeries>
@@ -38,11 +37,11 @@ public:
 
 private slots:
     void onDataReady();
-    void refreshChart();
 
 private:
     void initSocket();
     void initChart();
+    void refreshChart();
 
     Ui::MainWindow *ui;
 
@@ -52,10 +51,6 @@ private:
 
     /* Data: freq → latest sample */
     QMap<quint32, bia_sample_t> m_samples;
-    bool m_dirty = false;
-
-    /* Periodic refresh timer */
-    QTimer *m_timer = nullptr;
 
     /* Chart */
     QChartView *m_chartView = nullptr;
