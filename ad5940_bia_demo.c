@@ -310,11 +310,10 @@ int main(int argc, char *argv[])
 	}
 
 	/*
-	 * Set timeout: BIA ODR is 5Hz (200ms period). Use 5s timeout
-	 * to tolerate startup delay and occasional late data.
-	 * A value of 0 means no timeout (wait indefinitely).
+	 * Set timeout: Plan C parameters make each measurement cycle
+	 * ~27 seconds. Use 0 for no timeout (wait indefinitely).
 	 */
-	iio_context_set_timeout(ctx, 5000);
+	iio_context_set_timeout(ctx, 0);
 
 	/* ---- Find AD5940 device ---- */
 	dev = iio_context_find_device(ctx, "ad5940");

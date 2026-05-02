@@ -60,13 +60,11 @@ void MainWindow::initChart()
     m_phaseSeries->setPen(phasePen);
     m_chart->addSeries(m_phaseSeries);
 
-    /* ---- X axis — logarithmic frequency ---- */
-    m_xAxis = new QLogValueAxis();
+    /* ---- X axis — linear frequency ---- */
+    m_xAxis = new QValueAxis();
     m_xAxis->setTitleText("Frequency (Hz)");
-    m_xAxis->setBase(10);
     m_xAxis->setRange(1e3, 2e5);
     m_xAxis->setLabelFormat("%.0f");
-    m_xAxis->setMinorTickCount(-1);
     m_chart->addAxis(m_xAxis, Qt::AlignBottom);
     m_magSeries->attachAxis(m_xAxis);
     m_phaseSeries->attachAxis(m_xAxis);

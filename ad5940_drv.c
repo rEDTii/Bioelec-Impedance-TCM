@@ -49,17 +49,21 @@ static bool sweep_en = true;
 module_param(sweep_en, bool, 0644);
 MODULE_PARM_DESC(sweep_en, "Enable frequency sweep (default: 1)");
 
-static uint sweep_start_hz = 10000;
+static uint sweep_start_hz = 10;
 module_param(sweep_start_hz, uint, 0644);
-MODULE_PARM_DESC(sweep_start_hz, "Sweep start frequency in Hz (default: 10000)");
+MODULE_PARM_DESC(sweep_start_hz, "Sweep start frequency in Hz (default: 10)");
 
-static uint sweep_stop_hz = 100000;
+static uint sweep_stop_hz = 120;
 module_param(sweep_stop_hz, uint, 0644);
-MODULE_PARM_DESC(sweep_stop_hz, "Sweep stop frequency in Hz (default: 100000)");
+MODULE_PARM_DESC(sweep_stop_hz, "Sweep stop frequency in Hz (default: 120)");
 
 static uint sweep_points = 10;
 module_param(sweep_points, uint, 0644);
 MODULE_PARM_DESC(sweep_points, "Number of sweep frequency points (default: 10)");
+
+static uint sweep_type = 0;  /* 0=linear, 1=log */
+module_param(sweep_type, uint, 0644);
+MODULE_PARM_DESC(sweep_type, "Sweep type: 0=linear, 1=logarithmic (default: 0)");
 
 /* ------------------------------------------------------------------ */
 /*  IIO channel definitions – DFT impedance mode (BIA 4-wire)        */
@@ -608,16 +612,18 @@ static int ad5940_probe(struct spi_device *spi)
 
 	/* Configure sweep from module parameters */
 	priv->sweep_en = sweep_en;
-	priv->sweep_type = AD5940_SWEEP_LINEAR;
+	priv->sweep_type = sweep_type ? AD5940_SWEEP_LOG : AD5940_SWEEP_LINEAR;
 	priv->sweep_start_hz = sweep_start_hz;
 	priv->sweep_stop_hz = sweep_stop_hz;
 	/* 钳位(clamp): 将 sweep_points 限制在 [1, AD5940_MAX_SWEEP_POINTS] 范围内 */
 	priv->sweep_points = clamp_val(sweep_points, 1,
 				       AD5940_MAX_SWEEP_POINTS); 
 	if (priv->sweep_en) {
-		dev_info(dev, "Sweep: %uHz - %uHz, %u points, linear\n",
+		dev_info(dev, "Sweep: %uHz - %uHz, %u points, %s\n",
 			 priv->sweep_start_hz, priv->sweep_stop_hz,
-			 priv->sweep_points);
+			 priv->sweep_points,
+			 priv->sweep_type == AD5940_SWEEP_LOG ?
+				"log" : "linear");
 	}
 
 	/* Setup SPI: CPOL=0, CPHA=0 (SPI mode 0) */

@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/spi/spi.h>
 #include <linux/delay.h>
+#include <linux/log2.h>
 #include <asm/unaligned.h>
 #include "ad5940_core.h"
 
@@ -762,14 +763,16 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 
 	/* 4b: AD5940_ADCFilterCfgS - ADCFILTERCON
 	 * Matching ADI's RMW: ReadReg → keep AVRGEN → set new fields.
-	 * ADCRate=1(800kHz), Sinc3Osr=2, Sinc2Osr=22, AvgNum=16
+	 *
+	 * Plan C: Conservative parameters for low-frequency support.
+	 * ADCRate=1(800kHz), Sinc3Osr=4, Sinc2Osr=667, AvgNum=16
 	 * BpNotch=bTRUE(LPFBYPEN=1), BpSinc3=FALSE, Sinc2NotchEnable=TRUE
 	 */
 	sg.shadow.shadow_adcfiltcon &= AD5940_ADCFILTERCON_AVRGEN;
 	sg.shadow.shadow_adcfiltcon |= AD5940_ADCRATE_800KHZ;
 	sg.shadow.shadow_adcfiltcon |=
-		(AD5940_ADCSINC3OSR_2 << AD5940_ADCFILTERCON_SINC3OSR_SHIFT) |
-		(AD5940_ADCSINC2OSR_22 << AD5940_ADCFILTERCON_SINC2OSR_SHIFT) |
+		(AD5940_ADCSINC3OSR_4 << AD5940_ADCFILTERCON_SINC3OSR_SHIFT) |
+		(AD5940_ADCSINC2OSR_667 << AD5940_ADCFILTERCON_SINC2OSR_SHIFT) |
 		(AD5940_ADCAVGNUM_16 << AD5940_ADCFILTERCON_AVRGNUM_SHIFT);
 	sg.shadow.shadow_adcfiltcon |= AD5940_ADCFILTERCON_LPFBYPEN; /* BpNotch=bTRUE */
 	seq_write_reg(&sg, AD5940_REG_ADCFILTERCON, sg.shadow.shadow_adcfiltcon);
@@ -787,9 +790,11 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 
 	/* 4d: AD5940_DFTCfgS - ADCFILTERCON (clear AVRGEN), DFTCON
 	 * Matching ADI's RMW: ReadReg → &= ~AVRGEN → WriteReg
-	 * DftSrc=DFTSRC_SINC3(≠AVG), so clear AVRGEN
-	 * DFTCON: HanWinEn=1, DftNum=8192(=11), DftSrc=SINC3(=1)
-	 * = BIT(0) | (11<<4) | (1<<20)
+	 * DftSrc=DFTSRC_SINC2NOTCH(≠AVG), so clear AVRGEN
+	 *
+	 * Plan C: DFTSRC=SINC2NOTCH for low-frequency support.
+	 * DFTCON: HanWinEn=1, DftNum=8192(=11), DftSrc=SINC2NOTCH(=0)
+	 * = BIT(0) | (11<<4) | (0<<20)
 	 */
 	sg.shadow.shadow_adcfiltcon &= ~AD5940_ADCFILTERCON_AVRGEN;
 	seq_write_reg(&sg, AD5940_REG_ADCFILTERCON, sg.shadow.shadow_adcfiltcon);
@@ -797,7 +802,7 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 	seq_write_reg(&sg, AD5940_REG_DFTCON,
 		      BIT(0) |  /* HANNINGEN */
 		      (AD5940_DFTNUM_8192 << AD5940_DFTCON_DFTNUM_SHIFT) |
-		      (AD5940_DFTSRC_SINC3 << AD5940_DFTCON_DFTINSEL_SHIFT));
+		      (AD5940_DFTSRC_SINC2NOTCH << AD5940_DFTCON_DFTINSEL_SHIFT));
 
 	/* 4e: AD5940_StatisticCfgS - STATSCON = 0 (disabled) */
 	seq_write_reg(&sg, AD5940_REG_STATSCON, 0x00);
@@ -931,22 +936,28 @@ static int ad5940_bia_gen_measure_seq(struct ad5940_priv *priv,
 	/* AD5940_SEQGenInsert(SEQ_WAIT(WaitClks)) */
 	seq_wait(&sg, AD5940_BIA_WAIT_CLKS);
 
-	/* AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE) */
+	/*
+	 * AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bFALSE)
+	 * Keep WG and ADCPWR running between the two DFTs to avoid
+	 * WG phase reset.  At low frequencies (e.g. 10Hz), restarting
+	 * the WG causes a ~180° phase offset between the two DFT
+	 * results because WG restarts from phase 0 while the first
+	 * DFT accumulated significant phase.
+	 */
 	seq_afe_ctrl(&sg,
-		     AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT |
-		     AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR,
+		     AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT,
 		     false);
 
 	/* AD5940_ADCMuxCfgS(ADCMUXP_AIN3, ADCMUXN_AIN2) */
 	seq_adc_mux_cfg(&sg, AD5940_ADCMUXP_AIN3, AD5940_ADCMUXN_AIN2);
 
-	/* AD5940_AFECtrlS(AFECTRL_WG|AFECTRL_ADCPWR, bTRUE) */
-	seq_afe_ctrl(&sg,
-		     AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR,
-		     true);
-
-	/* AD5940_SEQGenInsert(SEQ_WAIT(16*50))  - wait 50us (ADI's DFT_WAIT) */
-	seq_wait(&sg, 16 * 50);
+	/*
+	 * WG and ADCPWR are already on — no need to re-enable.
+	 * Just wait for signal settling after MUX switch.
+	 * Use a slightly longer settle time (250us vs 50us) to ensure
+	 * the new MUX path is fully settled at low frequencies.
+	 */
+	seq_wait(&sg, 16 * 250);
 
 	/* AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE) */
 	seq_afe_ctrl(&sg,
@@ -1026,6 +1037,65 @@ u32 ad5940_sweep_calc_freq(u32 start_hz, u32 stop_hz, u32 points,
 		return start_hz;
 
 	switch (type) {
+	case AD5940_SWEEP_LOG:
+		/* Logarithmic: freq[i] = start * (stop/start)^(i/(points-1))
+		 * Compute via incremental multiplication in Q16 fixed-point.
+		 * step = (stop/start)^(1/(N-1)), freq[i] = start * step^i
+		 */
+		if (start_hz == 0 || stop_hz == 0)
+			return start_hz;
+		if (index == 0)
+			return start_hz;
+		if (index >= points - 1)
+			return stop_hz;
+		{
+			/* Compute step ratio using Newton-Raphson in Q16:
+			 * Find r such that r^(N-1) = stop/start
+			 * i.e. r^(N-1) = ratio_q16
+			 */
+			u32 n = points - 1;
+			u64 ratio_q16 = div64_u64((u64)stop_hz << 16,
+						   start_hz);
+			u64 r;   /* step ratio in Q16 */
+			u64 freq_q16;
+			int j;
+
+			/* Initial guess: r ≈ 2^(log2(ratio)/n) */
+			{
+				int log2_r = fls64(ratio_q16) - 1 - 16;
+
+				if (log2_r < 0)
+					log2_r = 0;
+				r = 1ULL << (16 + log2_r / (int)n);
+			}
+
+			/* Newton-Raphson: r = r - (r^n - R) / (n * r^(n-1)) */
+			for (j = 0; j < 8; j++) {
+				u64 rn_n = (1ULL << 16);   /* Q16: 1.0 */
+				u64 rn_n1 = (1ULL << 16);  /* Q16: 1.0 */
+				s64 diff;
+				int k;
+
+				for (k = 0; k < (int)n; k++)
+					rn_n = (rn_n * r) >> 16;
+				for (k = 0; k < (int)n - 1; k++)
+					rn_n1 = (rn_n1 * r) >> 16;
+
+				diff = (s64)rn_n - (s64)ratio_q16;
+				if (diff == 0)
+					break;
+				/* delta = diff / (n * r^(n-1)), scaled by 2^16 */
+				r = r - div64_s64(diff << 16,
+						   (s64)n * (s64)rn_n1);
+			}
+
+			/* Compute freq = start * r^index */
+			freq_q16 = (u64)start_hz << 16;
+			for (j = 0; j < (int)index; j++)
+				freq_q16 = (freq_q16 * r) >> 16;
+
+			return freq_q16 >> 16;
+		}
 	case AD5940_SWEEP_LINEAR:
 	default:
 		/* Linear: freq[i] = start + i * (stop - start) / (points - 1) */
@@ -1413,8 +1483,8 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 		return ret;
 	val &= AD5940_ADCFILTERCON_AVRGEN;
 	val |= AD5940_ADCRATE_800KHZ;
-	val |= (AD5940_ADCSINC2OSR_22 << AD5940_ADCFILTERCON_SINC2OSR_SHIFT);
-	val |= (AD5940_ADCSINC3OSR_2 << AD5940_ADCFILTERCON_SINC3OSR_SHIFT);
+	val |= (AD5940_ADCSINC2OSR_667 << AD5940_ADCFILTERCON_SINC2OSR_SHIFT);
+	val |= (AD5940_ADCSINC3OSR_4 << AD5940_ADCFILTERCON_SINC3OSR_SHIFT);
 	val |= (AD5940_ADCAVGNUM_16 << AD5940_ADCFILTERCON_AVRGNUM_SHIFT);
 	val |= AD5940_ADCFILTERCON_LPFBYPEN;
 	ad5940_spi_write(priv, AD5940_REG_ADCFILTERCON, val);
@@ -1436,7 +1506,7 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 
 	val = BIT(AD5940_DFTCON_HANNINGEN_SHIFT) |
 	      (AD5940_DFTNUM_8192 << AD5940_DFTCON_DFTNUM_SHIFT) |
-	      (AD5940_DFTSRC_SINC3 << AD5940_DFTCON_DFTINSEL_SHIFT);
+	      (AD5940_DFTSRC_SINC2NOTCH << AD5940_DFTCON_DFTINSEL_SHIFT);
 	ad5940_spi_write(priv, AD5940_REG_DFTCON, val);
 
 	ad5940_spi_write(priv, AD5940_REG_STATSCON, 0);
@@ -1470,12 +1540,18 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 
 		usleep_range(250, 300);
 
+		/* Clear stale DFTRDY before starting new conversion
+		 * (matching ADI's AD5940_INTCClrFlag before ADCCNV enable)
+		 */
+		ad5940_spi_write(priv, AD5940_REG_INTCCLR,
+				 AD5940_AFEINTSRC_DFTRDY);
+
 		ret = rtia_cal_afe_ctrl(priv,
 			AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT, true);
 		if (ret)
 			goto restore_intc;
 
-		ret = rtia_cal_wait_dft_ready(priv, 200);
+		ret = rtia_cal_wait_dft_ready(priv, 35000);
 		if (ret) {
 			dev_err(dev, "RTIA cal: V_Rcal DFTRDY timeout at %uHz\n",
 				freq_hz);
@@ -1511,12 +1587,16 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 
 		usleep_range(250, 300);
 
+		/* Clear stale DFTRDY before starting new conversion */
+		ad5940_spi_write(priv, AD5940_REG_INTCCLR,
+				 AD5940_AFEINTSRC_DFTRDY);
+
 		ret = rtia_cal_afe_ctrl(priv,
 			AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT, true);
 		if (ret)
 			goto restore_intc;
 
-		ret = rtia_cal_wait_dft_ready(priv, 200);
+		ret = rtia_cal_wait_dft_ready(priv, 35000);
 		if (ret) {
 			dev_err(dev, "RTIA cal: V_Rtia DFTRDY timeout at %uHz\n",
 				freq_hz);
@@ -1633,21 +1713,21 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 							    rtia_real_mohm);
 			}
 
-			dev_info(dev,
-				 "RTIA cal[%d] @%uHz: Mag=%lld.%03lld Ohm, Phase=%d.%03d deg\n",
-				 i, freq_hz,
-				 div_s64(priv->sweep_en ?
+			{
+				s64 mag_mohm = priv->sweep_en ?
 					priv->rtia_cal_table[i].magnitude_mohm :
-					priv->rtia_cal.magnitude_mohm, 1000),
-				 (priv->sweep_en ?
-					priv->rtia_cal_table[i].magnitude_mohm :
-					priv->rtia_cal.magnitude_mohm) % 1000,
-				 (priv->sweep_en ?
+					priv->rtia_cal.magnitude_mohm;
+				s32 ph_mdeg = priv->sweep_en ?
 					priv->rtia_cal_table[i].phase_mdeg :
-					priv->rtia_cal.phase_mdeg) / 1000,
-				 (priv->sweep_en ?
-					priv->rtia_cal_table[i].phase_mdeg :
-					priv->rtia_cal.phase_mdeg) % 1000);
+					priv->rtia_cal.phase_mdeg;
+				dev_info(dev,
+					 "RTIA cal[%d] @%uHz: Mag=%lld.%03lld Ohm, Phase=%d.%03d deg\n",
+					 i, freq_hz,
+					 div_s64(mag_mohm, 1000),
+					 mag_mohm >= 0 ? mag_mohm % 1000 : -(mag_mohm % 1000),
+					 ph_mdeg / 1000,
+					 ph_mdeg >= 0 ? ph_mdeg % 1000 : -(ph_mdeg % 1000));
+			}
 		}
 	}
 

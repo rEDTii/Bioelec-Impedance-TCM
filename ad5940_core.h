@@ -235,10 +235,19 @@
 #define AD5940_ADCFILTERCON_AVRGEN		BIT(7)	/* Average function enable */
 #define AD5940_ADCFILTERCON_LPFBYPEN		BIT(4)	/* Bypass 50/60Hz LP filter */
 
-/* ADC enum values */
+/* ADC enum values - register values matching ADI sinc2osr_table/sinc3osr_table indices */
 #define AD5940_ADCRATE_800KHZ		1
+#define AD5940_ADCSINC3OSR_5		0
+#define AD5940_ADCSINC3OSR_4		1
 #define AD5940_ADCSINC3OSR_2		2
 #define AD5940_ADCSINC2OSR_22		0
+#define AD5940_ADCSINC2OSR_44		1
+#define AD5940_ADCSINC2OSR_89		2
+#define AD5940_ADCSINC2OSR_178		3
+#define AD5940_ADCSINC2OSR_267		4
+#define AD5940_ADCSINC2OSR_533		5
+#define AD5940_ADCSINC2OSR_640		6
+#define AD5940_ADCSINC2OSR_667		7
 #define AD5940_ADCAVGNUM_16		3
 
 /* DFTCON bits - Source: BITP_AFE_DFTCON_* */
@@ -246,8 +255,16 @@
 #define AD5940_DFTCON_DFTNUM_SHIFT		4	/* bits[7:4] */
 #define AD5940_DFTCON_DFTINSEL_SHIFT		20	/* bits[21:20] */
 
-/* DFT enum values */
+/* DFT enum values - register values for DFTCON.DFTINSEL field
+ * Matching ADI definitions:
+ *   DFTSRC_SINC2NOTCH = 0 (SINC2+Notch filter output)
+ *   DFTSRC_SINC3      = 1 (SINC3 filter output)
+ *   DFTSRC_ADCRAW     = 2 (Raw ADC data)
+ *   DFTSRC_AVG        = 3 (Average output of SINC3)
+ */
+#define AD5940_DFTNUM_4096		10
 #define AD5940_DFTNUM_8192		11
+#define AD5940_DFTSRC_SINC2NOTCH	0
 #define AD5940_DFTSRC_SINC3		1
 
 /* FIFOCON bits - Source: BITP_AFE_FIFOCON_* */
@@ -426,15 +443,13 @@
 /*
  * BIA ODR and WUPT clock frequency.
  *
- * ADI sets BiaODR=20 in AD5940BIAStructInit, but AppBIASeqMeasureGen()
- * adjusts it: if BiaODR > MaxODR, then BiaODR = MaxODR.
+ * Plan C: With conservative DSP parameters (SINC2NOTCH, SINC3OSR=4,
+ * SINC2OSR=667, DFTNUM=8192), each DFT takes ~27.3 seconds.
+ * Two DFTs per measure cycle ≈ 54.7 seconds.
  *
- * With DFTNUM_8192 + ADCSINC3OSR_2 + DFTSRC_SINC3:
- *   WaitClks = 1310845 per DFT, ~82ms
- *   Total measure cycle ≈ 164ms → MaxODR ≈ 6Hz
- *
- * So ADI's actual effective ODR is ~6Hz, not 20Hz.
- * We set AD5940_BIA_ODR to match this.
+ * WUPT is kept at 5 Hz; the sequencer ignores WUPT triggers while
+ * running the measure sequence, so the effective measurement rate is
+ * determined by the sequence execution time (~0.018 Hz).
  */
 #define AD5940_BIA_ODR			5
 #define AD5940_BIA_WUPT_CLK_FREQ	32000
@@ -509,22 +524,33 @@ static const struct {
  *   Step 2: Voltage across body (ADC MUX = AIN3/AIN2)
  * Each DFT produces 2 FIFO words (Real + Imaginary), total = 4 words.
  *
- * WaitClks calculation via AD5940_ClksCalculate():
- *   DataType = DATATYPE_DFT, DftSrc = DFTSRC_SINC3
- *   DataCount = 1L<<(DFTNUM_8192+2) = 2^15 = 32768
- *   ADCSinc3Osr = ADCSINC3OSR_2 → sinc3osr_table[2] = 2
- *   RatioSys2AdcClk = SysClkFreq/AdcClkFreq = 16MHz/16MHz = 1
- *   DATATYPE_SINC3: temp = ((32768+2)*2+1)*20*1 = 65541*20 = 1310820
- *   DATATYPE_DFT: temp += 25 → WaitClks = 1310845
+ * Plan C: Conservative worst-case parameters for low-frequency support.
+ * Uses SINC2NOTCH DFT source with large OSR to ensure adequate DFT
+ * observation window down to 10Hz.
  *
- * Measure sequence total cycle time (approx):
- *   2 * WaitClks + 16*250 + 2*16*50 + ~20 (write commands) ≈ 2627330
- *   AD5940_ClksCalculate with BIA params:
- *     DataType=DFT, DftSrc=SINC3, DftNum=8192, Sinc3Osr=2, Sinc2Osr=22
- *     = ((8192+2)*2+1)*20*1 + 25 = 327805
- *   At 16MHz: ~20.5ms per DFT → MaxODR ≈ 48.8 Hz
+ * Key fix: WG (waveform generator) is kept running continuously between
+ * the two DFT measurements to avoid WG phase reset at low frequencies.
+ * At 10Hz, restarting WG causes ~180° phase offset because the second
+ * DFT starts from WGPHASE=0 while the first DFT accumulated significant
+ * phase. By keeping WG on, both DFTs share the same continuous waveform.
+ *
+ * WaitClks calculation via AD5940_ClksCalculate():
+ *   DataType = DATATYPE_DFT, DftSrc = DFTSRC_SINC2NOTCH, BpNotch = TRUE
+ *   DataCount = 1L<<(DFTNUM_8192+2) = 1L<<13 = 8192
+ *   ADCSinc3Osr = ADCSINC3OSR_4 (=1) → sinc3osr_table[1] = 4
+ *   ADCSinc2Osr = ADCSINC2OSR_667 (=7) → sinc2osr_table[7] = 667
+ *   RatioSys2AdcClk = SysClkFreq/AdcClkFreq = 16MHz/16MHz = 1
+ *
+ *   DATATYPE_SINC2: temp = (8192+1)*667 + 1 = 5464732
+ *   DATATYPE_SINC3: temp = ((5464732+2)*4+1)*20*1 = 437178740
+ *   DATATYPE_SINC2: temp += 15 → 437178755
+ *   DATATYPE_DFT:   temp += 25 → WaitClks = 437178780
+ *
+ *   DFT observation window = 8192 / (800000/(667*4)) ≈ 27.3 seconds
+ *   At 10Hz: ~273 signal periods (>> 8 minimum)
+ *   Two DFTs per cycle ≈ 54.7 seconds per measurement
  */
-#define AD5940_BIA_WAIT_CLKS	327805
+#define AD5940_BIA_WAIT_CLKS	437178780
 
 /*
  * AFECTRL bit definitions - matching ADI's AFECTRL_* constants.
@@ -577,9 +603,10 @@ struct ad5940_rtia_cal_result {
 	s64	imag_mohm;
 };
 
-/* Sweep type - extensible for future modes (e.g. logarithmic) */
+/* Sweep type - logarithmic gives more points at low frequencies */
 enum ad5940_sweep_type {
 	AD5940_SWEEP_LINEAR = 0,
+	AD5940_SWEEP_LOG,
 };
 
 /**

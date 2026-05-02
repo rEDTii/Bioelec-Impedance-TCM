@@ -7,7 +7,7 @@
 #include <QtCharts/QChartView>
 #include <QtCharts/QChart>
 #include <QtCharts/QLineSeries>
-#include <QtCharts/QLogValueAxis>
+#include <QtCharts/QValueAxis>
 #include <QtCharts/QValueAxis>
 
 /* Must match ad5940_bia_demo.c / dummy_Qt.c */
@@ -57,7 +57,7 @@ private:
     QChart *m_chart = nullptr;
     QLineSeries *m_magSeries = nullptr;
     QLineSeries *m_phaseSeries = nullptr;
-    QLogValueAxis *m_xAxis = nullptr;
+    QValueAxis *m_xAxis = nullptr;
     QValueAxis *m_yMagAxis = nullptr;
     QValueAxis *m_yPhaseAxis = nullptr;
 };
