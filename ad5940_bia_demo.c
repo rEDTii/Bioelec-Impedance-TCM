@@ -144,6 +144,14 @@ static void compute_impedance(int32_t curr_real, int32_t curr_imag,
 	float z_phase = volt_phase - curr_phase
 		      + rtia_phase_deg * (float)M_PI / 180.0f;
 
+	/* Normalize phase to (-π, π] to avoid wrap-around artifacts
+	 * (e.g. 358° instead of -2°). atan2 subtraction can produce
+	 * results outside (-π, π] when the two angles are on opposite
+	 * sides of the ±π boundary.  BIA impedance phase is physically
+	 * bounded to (-90°, 90°), so the normalized value is always correct.
+	 */
+	z_phase = atan2f(sinf(z_phase), cosf(z_phase));
+
 	float z_phase_deg = z_phase * 180.0f / (float)M_PI;
 
 	result->magnitude  = z_mag;

@@ -681,7 +681,12 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 	 * SinFreqWord calculated from init_freq_hz @ 16MHz SysClk
 	 * SinAmplitudeWord = 0x7FF (800mVpp, max for ExcitBufGain=2/HsDacGain=1)
 	 * SinPhaseWord = 0, SinOffsetWord = 0
-	 * WGCON: WGTYPE_SIN=2, GainCalEn=0, OffsetCalEn=0
+	 * WGCON: WGTYPE_SIN=2, GainCalEn=1, OffsetCalEn=1
+	 * DACGAINCAL(BIT5) and DACOFFSETCAL(BIT4) enabled to match ADI's
+	 * Impedance_Adjustable example (GainCalEn=bTRUE, OffsetCalEn=bTRUE).
+	 * This auto-calibrates WG DAC gain/offset for more accurate sine output,
+	 * especially important at low frequencies where waveform quality directly
+	 * impacts DFT precision.
 	 */
 	seq_write_reg(&sg, AD5940_REG_WGFCW,
 		      ad5940_wg_freq_word_cal(init_freq_hz, 16000000));
@@ -689,7 +694,8 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 	seq_write_reg(&sg, AD5940_REG_WGOFFSET, 0x00);
 	seq_write_reg(&sg, AD5940_REG_WGPHASE, 0x00);
 	seq_write_reg(&sg, AD5940_REG_WGCON,
-		      AD5940_WGTYPE_SIN << AD5940_WGCON_TYPESEL_SHIFT);
+		      (AD5940_WGTYPE_SIN << AD5940_WGCON_TYPESEL_SHIFT) |
+		      AD5940_WGCON_DACGAINCAL | AD5940_WGCON_DACOFFSETCAL);
 
 	/* ================================================================
 	 * Step 3: AD5940_LPLoopCfgS
@@ -735,12 +741,14 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 
 	/* 4a: AD5940_ADCBaseCfgS - ADCCON
 	 * Matching ADI's ADCBaseCfgS: full-write from zero (not RMW).
-	 * ADCMuxP=ADCMUXP_HSTIA_P(=1), ADCMuxN=ADCMUXN_HSTIA_N(=1), ADCPga=0
-	 * tempreg = MuxP | (MuxN<<8) | (Pga<<16) = 0x1 | (0x1<<8) = 0x101
+	 * ADCMuxP=ADCMUXP_HSTIA_P(=1), ADCMuxN=ADCMUXN_HSTIA_N(=1),
+	 * ADCPga=ADCPGA_1P5(=1) — matching all ADI examples' default.
+	 * tempreg = MuxP | (MuxN<<8) | (Pga<<16) = 0x1 | (0x1<<8) | (0x1<<16) = 0x10101
 	 */
 	sg.shadow.shadow_adccon =
 		(AD5940_ADCMUXP_HSTIA_P << AD5940_ADCCON_MUXSELP_SHIFT) |
-		(AD5940_ADCMUXN_HSTIA_N << AD5940_ADCCON_MUXSELN_SHIFT);
+		(AD5940_ADCMUXN_HSTIA_N << AD5940_ADCCON_MUXSELN_SHIFT) |
+		(AD5940_ADCPGA_1P5 << AD5940_ADCCON_GNPGA_SHIFT);
 	seq_write_reg(&sg, AD5940_REG_ADCCON, sg.shadow.shadow_adccon);
 
 	/* 4b: AD5940_ADCFilterCfgS - ADCFILTERCON

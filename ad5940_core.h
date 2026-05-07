@@ -499,7 +499,7 @@ static const struct {
  *   SysClkFreq = 16MHz, SinFreq = 50kHz, DacVoltPP = 800mV
  *   ExcitBufGain = EXCITBUFGAIN_2, HsDacGain = HSDACGAIN_1
  *   HsDacUpdateRate = 7, HstiaRtiaSel = HSTIARTIA_1K (=1)
- *   CtiaSel = 16, ADCPgaGain = ADCPGA_1 (=0)
+ *   CtiaSel = 16, ADCPgaGain = ADCPGA_1P5 (=1)
  *   ADCSinc3Osr = ADCSINC3OSR_2 (=2), ADCSinc2Osr = ADCSINC2OSR_22 (=0)
  *   DftNum = DFTNUM_8192 (=11), DftSrc = DFTSRC_SINC3 (=1), HanWinEn = true
  *   PwrMod = AFEPWR_LP (=0), AFEBW = 250kHz (=3)
