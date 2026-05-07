@@ -171,8 +171,10 @@ void MainWindow::onDataReady()
         m_samples[sample.freq_hz] = sample;
         gotData = true;
 
-        qDebug("Freq=%6u Hz  |Z|=%10.2f Ω  Phase=%8.2f °",
-               sample.freq_hz, sample.magnitude, sample.phase);
+        qDebug("Freq=%6u Hz  |Z|=%10.2f Ω  Phase=%8.2f °  DFT: I=(%d,%d) V=(%d,%d)",
+               sample.freq_hz, sample.magnitude, sample.phase,
+               sample.curr_real, sample.curr_imag,
+               sample.volt_real, sample.volt_imag);
     }
 
     if (gotData)

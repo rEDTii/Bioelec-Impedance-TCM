@@ -21,6 +21,10 @@ struct bia_sample_t {
     float resistance;    /* Real part R in Ohms */
     float reactance;     /* Imaginary part X in Ohms */
     quint32 freq_hz;     /* Excitation frequency in Hz */
+    qint32 curr_real;    /* Raw DFT: current channel real part (18-bit signed) */
+    qint32 curr_imag;    /* Raw DFT: current channel imaginary part */
+    qint32 volt_real;    /* Raw DFT: voltage channel real part */
+    qint32 volt_imag;    /* Raw DFT: voltage channel imaginary part */
 };
 
 QT_BEGIN_NAMESPACE

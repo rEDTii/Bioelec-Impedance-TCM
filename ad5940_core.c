@@ -424,25 +424,6 @@ EXPORT_SYMBOL_GPL(ad5940_seq_cmd_write);
 /*  We replicate this with shadow registers.                          */
 /* ================================================================== */
 
-/*
- * seq_shadow_regs - Shadow register state persisted across sequence generation
- *
- * ADI's SEQGen uses a static global SeqGenDB whose RegInfo array persists
- * between AppBIASeqCfgGen() and AppBIASeqMeasureGen() calls. We replicate
- * this by extracting shadow registers into a separate struct that can be
- * passed from init sequence generation to measure sequence generation.
- *
- * @shadow_afecon:      Shadow of AFECON register (tracked by AFECtrlS)
- * @shadow_adccon:      Shadow of ADCCON register (tracked by ADCMuxCfgS)
- * @shadow_bufsencon:   Shadow of BUFSENCON register (tracked by REFCfgS)
- * @shadow_adcfiltcon:  Shadow of ADCFILTERCON register (tracked by ADCFilterCfgS/DFTCfgS)
- */
-struct seq_shadow_regs {
-	u32	shadow_afecon;
-	u32	shadow_adccon;
-	u32	shadow_bufsencon;
-	u32	shadow_adcfiltcon;
-};
 
 /*
  * seq_gen_buf - Sequence generator buffer and state
@@ -609,7 +590,8 @@ static void seq_enter_sleep(struct seq_gen_buf *sg)
 static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 				   u32 *buf, int buf_size,
 				   struct seq_shadow_regs *shadow_out,
-				   u32 init_freq_hz)
+				   u32 init_freq_hz,
+				   const struct ad5940_freq_params *freq_params)
 {
 	struct seq_gen_buf sg;
 	int afecon_rd;
@@ -763,22 +745,24 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 
 	/* 4b: AD5940_ADCFilterCfgS - ADCFILTERCON
 	 * Matching ADI's RMW: ReadReg → keep AVRGEN → set new fields.
-	 *
-	 * Plan C: Conservative parameters for low-frequency support.
-	 * ADCRate=1(800kHz), Sinc3Osr=4, Sinc2Osr=667, AvgNum=16
-	 * BpNotch=bTRUE(LPFBYPEN=1), BpSinc3=FALSE, Sinc2NotchEnable=TRUE
+	 * Uses per-band parameters from freq_params.
 	 */
 	sg.shadow.shadow_adcfiltcon &= AD5940_ADCFILTERCON_AVRGEN;
 	sg.shadow.shadow_adcfiltcon |= AD5940_ADCRATE_800KHZ;
 	sg.shadow.shadow_adcfiltcon |=
-		(AD5940_ADCSINC3OSR_4 << AD5940_ADCFILTERCON_SINC3OSR_SHIFT) |
-		(AD5940_ADCSINC2OSR_667 << AD5940_ADCFILTERCON_SINC2OSR_SHIFT) |
-		(AD5940_ADCAVGNUM_16 << AD5940_ADCFILTERCON_AVRGNUM_SHIFT);
-	sg.shadow.shadow_adcfiltcon |= AD5940_ADCFILTERCON_LPFBYPEN; /* BpNotch=bTRUE */
+		(AD5940_ADCAVGNUM_16 << AD5940_ADCFILTERCON_AVRGNUM_SHIFT) |  /* Don't care: AVG disabled */
+		(freq_params->sinc3osr << AD5940_ADCFILTERCON_SINC3OSR_SHIFT) |
+		(freq_params->sinc2osr << AD5940_ADCFILTERCON_SINC2OSR_SHIFT);
+	if (freq_params->dft_src == AD5940_DFTSRC_SINC2NOTCH)
+		sg.shadow.shadow_adcfiltcon |= AD5940_ADCFILTERCON_LPFBYPEN;
 	seq_write_reg(&sg, AD5940_REG_ADCFILTERCON, sg.shadow.shadow_adcfiltcon);
 
-	/* ADCFilterCfgS calls AFECtrlS(SINC2NOTCH, bTRUE) → write AFECON */
-	seq_afe_ctrl(&sg, AD5940_AFECTRL_SINC2NOTCH, true);
+	/* ADCFilterCfgS calls AFECtrlS(SINC2NOTCH, bTRUE/bFALSE) → write AFECON
+	 * Conditionally enable SINC2NOTCH based on DFT source.
+	 * Band 1-2 (SINC2NOTCH path): enable; Band 3 (SINC3 path): disable.
+	 */
+	seq_afe_ctrl(&sg, AD5940_AFECTRL_SINC2NOTCH,
+		     freq_params->dft_src == AD5940_DFTSRC_SINC2NOTCH);
 
 	/* 4c: AD5940_ADCDigCompCfgS - ADCMIN, ADCMINSM, ADCMAX, ADCMAXSMEN
 	 * memset to 0 in ADI's code → all zeros
@@ -790,19 +774,16 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 
 	/* 4d: AD5940_DFTCfgS - ADCFILTERCON (clear AVRGEN), DFTCON
 	 * Matching ADI's RMW: ReadReg → &= ~AVRGEN → WriteReg
-	 * DftSrc=DFTSRC_SINC2NOTCH(≠AVG), so clear AVRGEN
-	 *
-	 * Plan C: DFTSRC=SINC2NOTCH for low-frequency support.
-	 * DFTCON: HanWinEn=1, DftNum=8192(=11), DftSrc=SINC2NOTCH(=0)
-	 * = BIT(0) | (11<<4) | (0<<20)
+	 * DftSrc≠AVG for both SINC2NOTCH and SINC3, so clear AVRGEN.
+	 * Uses per-band DFTNUM and DFTSRC from freq_params.
 	 */
 	sg.shadow.shadow_adcfiltcon &= ~AD5940_ADCFILTERCON_AVRGEN;
 	seq_write_reg(&sg, AD5940_REG_ADCFILTERCON, sg.shadow.shadow_adcfiltcon);
 
 	seq_write_reg(&sg, AD5940_REG_DFTCON,
 		      BIT(0) |  /* HANNINGEN */
-		      (AD5940_DFTNUM_8192 << AD5940_DFTCON_DFTNUM_SHIFT) |
-		      (AD5940_DFTSRC_SINC2NOTCH << AD5940_DFTCON_DFTINSEL_SHIFT));
+		      (freq_params->dft_num << AD5940_DFTCON_DFTNUM_SHIFT) |
+		      (freq_params->dft_src << AD5940_DFTCON_DFTINSEL_SHIFT));
 
 	/* 4e: AD5940_StatisticCfgS - STATSCON = 0 (disabled) */
 	seq_write_reg(&sg, AD5940_REG_STATSCON, 0x00);
@@ -813,18 +794,18 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 	 * ADI enables: HPREFPWR|HSTIAPWR|INAMPPWR|EXTBUFPWR|
 	 *              WG|DACREFPWR|HSDACPWR|SINC2NOTCH
 	 *
-	 * Note: SINC2NOTCH was already enabled in step 4b's AFECtrlS call,
-	 * but ADI's code explicitly includes it in this AFECtrlS call too.
-	 * The shadow_afecon already has SINC2NOTCH set from step 4b,
-	 * so setting it again is a no-op on the shadow but generates
-	 * an additional SEQ_WR(AFECON) - matching ADI exactly.
+	 * SINC2NOTCH is conditionally included based on DFT source:
+	 * Band 1-2 (SINC2NOTCH) → enable; Band 3 (SINC3) → skip.
 	 * ================================================================ */
-	seq_afe_ctrl(&sg,
-		     AD5940_AFECTRL_HPREFPWR | AD5940_AFECTRL_HSTIAPWR |
-		     AD5940_AFECTRL_INAMPPWR | AD5940_AFECTRL_EXTBUFPWR |
-		     AD5940_AFECTRL_WG | AD5940_AFECTRL_DACREFPWR |
-		     AD5940_AFECTRL_HSDACPWR | AD5940_AFECTRL_SINC2NOTCH,
-		     true);
+	{
+		u32 afe_en = AD5940_AFECTRL_HPREFPWR | AD5940_AFECTRL_HSTIAPWR |
+			     AD5940_AFECTRL_INAMPPWR | AD5940_AFECTRL_EXTBUFPWR |
+			     AD5940_AFECTRL_WG | AD5940_AFECTRL_DACREFPWR |
+			     AD5940_AFECTRL_HSDACPWR;
+		if (freq_params->dft_src == AD5940_DFTSRC_SINC2NOTCH)
+			afe_en |= AD5940_AFECTRL_SINC2NOTCH;
+		seq_afe_ctrl(&sg, afe_en, true);
+	}
 
 	/* ================================================================
 	 * Step 6: AD5940_SEQGpioCtrlS(0) - No GPIO pins during init
@@ -850,11 +831,15 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
  * @buf_size: buffer capacity (in u32 words)
  * @shadow_in: shadow register state from init sequence generation
  *
- * Replicates the EXACT call order of ADI's AppBIASeqMeasureGen():
+ * Generates the measurement sequence, including DSP reconfiguration
+ * for band changes (matching ADI's Impedance_Adjustable approach).
+ *
+ * Sequence structure:
  *
  *   SEQGpioCtrlS(AGPIO_Pin6)
  *   SEQGenInsert(SEQ_WAIT(16*250))
  *   SWMatrixCfgS(D=CE0, P=CE0, N=AIN1, T=AIN1|TRTIA)
+ *   --- DSP reconfiguration (ADCFILTERCON, DFTCON, SINC2NOTCH) ---
  *   ADCMuxCfgS(HSTIA_P, HSTIA_N)
  *   AFECtrlS(WG|ADCPWR, bTRUE)
  *   SEQGenInsert(SEQ_WAIT(16*50))
@@ -879,7 +864,8 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
  */
 static int ad5940_bia_gen_measure_seq(struct ad5940_priv *priv,
 				       u32 *buf, int buf_size,
-				       const struct seq_shadow_regs *shadow_in)
+				       const struct seq_shadow_regs *shadow_in,
+				       const struct ad5940_freq_params *freq_params)
 {
 	struct seq_gen_buf sg;
 
@@ -917,6 +903,46 @@ static int ad5940_bia_gen_measure_seq(struct ad5940_priv *priv,
 			  AD5940_SWN_AIN1,
 			  AD5940_SWT_AIN1 | AD5940_SWT_TRTIA);
 
+	/*
+	 * Write ADCFILTERCON and DFTCON in the measure sequence so they
+	 * take effect during WUPT wakeup.  Direct SPI writes between
+	 * measurements may be lost if the AFE enters hibernate and
+	 * re-initializes registers on wakeup.  ADI's Impedance_Adjustable
+	 * example does the same: AppIMPCheckFreq() reconfigures the DSP
+	 * via the measurement sequence on each frequency change.
+	 */
+	{
+		u32 filtcon = AD5940_ADCRATE_800KHZ |
+			      (AD5940_ADCAVGNUM_16 <<
+			       AD5940_ADCFILTERCON_AVRGNUM_SHIFT) |
+			      (freq_params->sinc3osr <<
+			       AD5940_ADCFILTERCON_SINC3OSR_SHIFT) |
+			      (freq_params->sinc2osr <<
+			       AD5940_ADCFILTERCON_SINC2OSR_SHIFT);
+		if (freq_params->dft_src == AD5940_DFTSRC_SINC2NOTCH)
+			filtcon |= AD5940_ADCFILTERCON_LPFBYPEN;
+		seq_write_reg(&sg, AD5940_REG_ADCFILTERCON, filtcon);
+		/* Clear AVRGEN (DFT source, not average) */
+		filtcon &= ~AD5940_ADCFILTERCON_AVRGEN;
+		seq_write_reg(&sg, AD5940_REG_ADCFILTERCON, filtcon);
+	}
+
+	/* DFTCON */
+	seq_write_reg(&sg, AD5940_REG_DFTCON,
+		      BIT(AD5940_DFTCON_HANNINGEN_SHIFT) |
+		      (freq_params->dft_num <<
+		       AD5940_DFTCON_DFTNUM_SHIFT) |
+		      (freq_params->dft_src <<
+		       AD5940_DFTCON_DFTINSEL_SHIFT));
+
+	/* SINC2NOTCH enable must match DFT source */
+	if (freq_params->dft_src == AD5940_DFTSRC_SINC2NOTCH)
+		sg.shadow.shadow_afecon |= AD5940_AFECTRL_SINC2NOTCH;
+	else
+		sg.shadow.shadow_afecon &= ~AD5940_AFECTRL_SINC2NOTCH;
+	seq_write_reg(&sg, AD5940_REG_AFECON, sg.shadow.shadow_afecon);
+
+	/* ---- Step 1: Measure Current (HSTIA_P/N) ---- */
 	/* AD5940_ADCMuxCfgS(ADCMUXP_HSTIA_P, ADCMUXN_HSTIA_N) */
 	seq_adc_mux_cfg(&sg, AD5940_ADCMUXP_HSTIA_P, AD5940_ADCMUXN_HSTIA_N);
 
@@ -934,30 +960,37 @@ static int ad5940_bia_gen_measure_seq(struct ad5940_priv *priv,
 		     true);
 
 	/* AD5940_SEQGenInsert(SEQ_WAIT(WaitClks)) */
-	seq_wait(&sg, AD5940_BIA_WAIT_CLKS);
+	seq_wait(&sg, freq_params->wait_clks);
 
 	/*
-	 * AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bFALSE)
-	 * Keep WG and ADCPWR running between the two DFTs to avoid
-	 * WG phase reset.  At low frequencies (e.g. 10Hz), restarting
-	 * the WG causes a ~180° phase offset between the two DFT
-	 * results because WG restarts from phase 0 while the first
-	 * DFT accumulated significant phase.
+	 * AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE)
+	 * Stop ADC, DFT, WG, and ADC power — matching all three ADI examples
+	 * (BIA BodyImpedance.c, BIOZ-2Wire.c, Impedance_Adjustable.c).
+	 * The WG must be stopped before switching MUX so that the ADC input
+	 * is released; otherwise the second DFT still reads the old channel.
 	 */
 	seq_afe_ctrl(&sg,
-		     AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT,
+		     AD5940_AFECTRL_ADCCNV | AD5940_AFECTRL_DFT |
+		     AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR,
 		     false);
 
+	/* ---- Step 2: Measure Voltage (AIN3/AIN2) ---- */
 	/* AD5940_ADCMuxCfgS(ADCMUXP_AIN3, ADCMUXN_AIN2) */
 	seq_adc_mux_cfg(&sg, AD5940_ADCMUXP_AIN3, AD5940_ADCMUXN_AIN2);
 
 	/*
-	 * WG and ADCPWR are already on — no need to re-enable.
-	 * Just wait for signal settling after MUX switch.
-	 * Use a slightly longer settle time (250us vs 50us) to ensure
-	 * the new MUX path is fully settled at low frequencies.
+	 * AD5940_AFECtrlS(AFECTRL_WG|AFECTRL_ADCPWR, bTRUE)
+	 * Re-enable WG and ADC power after MUX switch, matching ADI flow.
+	 * WG restarts from phase 0 — this is the same behavior as all
+	 * three ADI examples.  The phase relationship between the two
+	 * DFT results is handled in the impedance calculation (not here).
 	 */
-	seq_wait(&sg, 16 * 250);
+	seq_afe_ctrl(&sg,
+		     AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR,
+		     true);
+
+	/* AD5940_SEQGenInsert(SEQ_WAIT(16*50)) - wait 50us for settling */
+	seq_wait(&sg, 16 * 50);
 
 	/* AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE) */
 	seq_afe_ctrl(&sg,
@@ -965,7 +998,7 @@ static int ad5940_bia_gen_measure_seq(struct ad5940_priv *priv,
 		     true);
 
 	/* AD5940_SEQGenInsert(SEQ_WAIT(WaitClks)) */
-	seq_wait(&sg, AD5940_BIA_WAIT_CLKS);
+	seq_wait(&sg, freq_params->wait_clks);
 
 	/* AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE) */
 	seq_afe_ctrl(&sg,
@@ -988,6 +1021,121 @@ static int ad5940_bia_gen_measure_seq(struct ad5940_priv *priv,
 
 	return sg.len;
 }
+
+/* ================================================================== */
+/*  Three-band DSP parameter lookup                                   */
+/* ================================================================== */
+
+/*
+ * OSR lookup tables indexed by register value.
+ * Used by ad5940_clks_calculate() to convert register values to actual OSR.
+ */
+static const u32 sinc2osr_table[] = {
+	22, 44, 89, 178, 267, 533, 640, 667, 800, 889, 1067, 1333
+};
+static const u32 sinc3osr_table[] = {
+	5, 4, 2
+};
+
+/**
+ * ad5940_clks_calculate - Calculate sequencer wait clocks for DFT
+ * @dft_num:   DFTNUM_xxx register value
+ * @dft_src:   DFTSRC_xxx register value
+ * @sinc3osr:  ADCSINC3OSR_xxx register value
+ * @sinc2osr:  ADCSINC2OSR_xxx register value
+ *
+ * Simplified port of ADI's AD5940_ClksCalculate() for the BIA use case.
+ * Always uses RatioSys2AdcClk=1 (SysClk=16MHz, AdcClk=16MHz) and
+ * BpNotch=TRUE (bypass notch filter).
+ *
+ * Return: wait clock count (in 16MHz clock cycles)
+ */
+static u32 ad5940_clks_calculate(u32 dft_num, u32 dft_src,
+				 u32 sinc3osr, u32 sinc2osr)
+{
+	u32 data_count, temp;
+
+	if (sinc3osr >= ARRAY_SIZE(sinc3osr_table) ||
+	    sinc2osr >= ARRAY_SIZE(sinc2osr_table))
+		return 0;
+
+	data_count = 1UL << (dft_num + 2);
+
+	if (dft_src == AD5940_DFTSRC_SINC3) {
+		/* SINC3 path: DATATYPE_DFT → DATATYPE_SINC3 */
+		temp = ((data_count + 2) * sinc3osr_table[sinc3osr] + 1) * 20;
+		temp += 25;
+		return temp;
+	}
+
+	/* SINC2NOTCH path with BpNotch=TRUE:
+	 * DATATYPE_DFT → DATATYPE_SINC2 → DATATYPE_SINC3 → back
+	 */
+	temp = (data_count + 1) * sinc2osr_table[sinc2osr] + 1;
+	temp = ((temp + 2) * sinc3osr_table[sinc3osr] + 1) * 20;
+	temp += 15 + 25;
+	return temp;
+}
+
+/**
+ * ad5940_get_freq_params - Get DSP parameters for a frequency (3-band lookup)
+ * @freq_hz: target excitation frequency in Hz
+ *
+ * Simple 3-band lookup table. Each band uses proven, static parameters:
+ *
+ *   Band 1 (freq <= 100Hz):
+ *     SINC2NOTCH, S2OSR=667, S3OSR=4, DFTNUM=8192, low power
+ *     ADC rate ~ 300Hz, 3x Nyquist up to 100Hz (planC-proven)
+ *
+ *   Band 2 (100Hz < freq <= 2kHz):
+ *     SINC2NOTCH, S2OSR=22, S3OSR=4, DFTNUM=8192, low power
+ *     ADC rate ~ 9091Hz, 3x Nyquist up to 3kHz
+ *
+ *   Band 3 (freq > 2kHz):
+ *     SINC3, S3OSR=2, DFTNUM=8192, high power (ADI BIA example)
+ *     ADC rate = 400kHz, supports up to ~200kHz
+ *
+ * Return: struct ad5940_freq_params with static settings
+ */
+struct ad5940_freq_params ad5940_get_freq_params(u32 freq_hz)
+{
+	struct ad5940_freq_params params = {0};
+
+	if (freq_hz <= 100) {
+		/* Band 1: Low frequency (planC-proven) */
+		params.dft_src  = AD5940_DFTSRC_SINC2NOTCH;
+		params.sinc2osr = AD5940_ADCSINC2OSR_667;
+		params.sinc3osr = AD5940_ADCSINC3OSR_4;
+		params.dft_num  = AD5940_DFTNUM_8192;
+		params.high_pwr = false;
+	} else if (freq_hz <= 2000) {
+		/* Band 2: Mid frequency */
+		params.dft_src  = AD5940_DFTSRC_SINC2NOTCH;
+		params.sinc2osr = AD5940_ADCSINC2OSR_22;
+		params.sinc3osr = AD5940_ADCSINC3OSR_4;
+		params.dft_num  = AD5940_DFTNUM_8192;
+		params.high_pwr = false;
+	} else {
+		/* Band 3: High frequency (ADI BIA example) */
+		params.dft_src  = AD5940_DFTSRC_SINC3;
+		params.sinc2osr = AD5940_ADCSINC2OSR_22; /* don't care in SINC3 */
+		params.sinc3osr = AD5940_ADCSINC3OSR_2;
+		params.dft_num  = AD5940_DFTNUM_8192;
+		params.high_pwr = true;
+	}
+
+	/* Calculate wait_clks — no ×2 margin, matching ADI's AD5940_ClksCalculate()
+	 * which only adds a 25-clock margin.  The ×2 margin caused Band1's
+	 * wait_clks to be ~874M clocks (54s/step), making total measurement
+	 * time ~108s which exceeded practical WUPT timing limits.
+	 */
+	params.wait_clks = ad5940_clks_calculate(
+		params.dft_num, params.dft_src,
+		params.sinc3osr, params.sinc2osr);
+
+	return params;
+}
+EXPORT_SYMBOL_GPL(ad5940_get_freq_params);
 
 /* ================================================================== */
 /*  Frequency sweep helpers                                            */
@@ -1119,21 +1267,18 @@ EXPORT_SYMBOL_GPL(ad5940_sweep_calc_freq);
  *   1. Update sweep_curr_freq_hz to the next measurement frequency
  *   2. Tag freq_of_data_hz for the next data push
  *   3. Advance sweep_index and calculate the following frequency
- *   4. Write WGFCW for the upcoming measurement
- *   5. Update RTIA calibration for the upcoming measurement
- *
- * This matches ADI's AppBIAISR flow:
- *   AppBIARegModify  → write WGFCW = SweepNextFreq
- *   AppBIADataProcess → SweepCurrFreq = SweepNextFreq
- *                       RtiaCurrValue = RtiaCalTable[SweepIndex]
- *                       AD5940_SweepNext → SweepIndex++, new SweepNextFreq
+ *   4. If frequency band changed, regenerate measure sequence + update PMBW
+ *   5. Write WGFCW for the upcoming measurement
+ *   6. Update RTIA calibration for the upcoming measurement
  *
  * Return: 0 on success, negative errno on SPI write failure
  */
 int ad5940_bia_sweep_step(struct ad5940_priv *priv)
 {
+	struct device *dev = &priv->spi->dev;
 	u32 freq_word;
 	int ret;
+	struct ad5940_freq_params next_params;
 
 	if (!priv->sweep_en)
 		return 0;
@@ -1154,6 +1299,79 @@ int ad5940_bia_sweep_step(struct ad5940_priv *priv)
 		priv->sweep_start_hz, priv->sweep_stop_hz,
 		priv->sweep_points, priv->sweep_type,
 		(priv->sweep_index + 1) % priv->sweep_points);
+
+	/* Check if the next frequency falls in a different band */
+	next_params = ad5940_get_freq_params(priv->sweep_curr_freq_hz);
+
+	if (next_params.sinc2osr != priv->curr_freq_params.sinc2osr ||
+	    next_params.sinc3osr != priv->curr_freq_params.sinc3osr ||
+	    next_params.dft_num != priv->curr_freq_params.dft_num ||
+	    next_params.dft_src != priv->curr_freq_params.dft_src ||
+	    next_params.high_pwr != priv->curr_freq_params.high_pwr) {
+		/*
+		 * Band change: regenerate measure sequence with new DSP
+		 * parameters and write it to SRAM. Also update PMBW if
+		 * power mode changed.
+		 */
+		u32 meas_buf[128];
+		int meas_len;
+
+		dev_info(dev, "Band change at %uHz: S2OSR %u→%u, DFTSRC %u→%u, HP %u→%u\n",
+			 priv->sweep_curr_freq_hz,
+			 priv->curr_freq_params.sinc2osr, next_params.sinc2osr,
+			 priv->curr_freq_params.dft_src, next_params.dft_src,
+			 priv->curr_freq_params.high_pwr, next_params.high_pwr);
+
+		/*
+		 * Regenerate measure sequence with new wait_clks.
+		 * Use saved shadow registers from initial sequence generation
+		 * so that seq_afe_ctrl() produces correct AFECON values
+		 * (instead of all-zero shadow which would clear critical bits).
+		 */
+		meas_len = ad5940_bia_gen_measure_seq(priv, meas_buf,
+						      ARRAY_SIZE(meas_buf),
+						      &priv->meas_shadow,
+						      &next_params);
+		if (meas_len > 0) {
+			ret = ad5940_seq_cmd_write(priv,
+						   priv->meas_seq_addr,
+						   meas_buf, meas_len);
+			if (ret) {
+				dev_err(dev, "Band change: meas seq write failed: %d\n",
+					ret);
+				return ret;
+			}
+
+			/* Update SEQ0INFO if command count changed */
+			if (meas_len != priv->meas_seq_len) {
+				ad5940_spi_write(priv, AD5940_REG_SEQ0INFO,
+						 (meas_len << 16) |
+						 priv->meas_seq_addr);
+			}
+
+			priv->meas_seq_len = meas_len;
+
+			dev_info(dev, "Regenerated meas seq: %d cmds at SRAM[%u]\n",
+				 meas_len, priv->meas_seq_addr);
+		}
+
+		/* Update PMBW if power mode changed */
+		if (next_params.high_pwr != priv->curr_freq_params.high_pwr) {
+			u32 pmbw_val = (3 << AD5940_PMBW_SYSBW_SHIFT);
+			if (next_params.high_pwr)
+				pmbw_val |= AD5940_PMBW_SYSHP;
+			ad5940_spi_write(priv, AD5940_REG_PMBW, pmbw_val);
+		}
+
+		/*
+		 * DSP register updates (ADCFILTERCON, DFTCON, SINC2NOTCH)
+		 * are now handled by the measurement sequence itself
+		 * (seq_write_reg commands), ensuring they take effect
+		 * reliably after WUPT wakeup.  No direct SPI writes needed.
+		 */
+
+		priv->curr_freq_params = next_params;
+	}
 
 	/* Write WGFCW for the upcoming measurement (at sweep_curr_freq_hz) */
 	freq_word = ad5940_wg_freq_word_cal(priv->sweep_curr_freq_hz,
@@ -1478,36 +1696,42 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 			 (AD5940_ADCMUXN_N_NODE << AD5940_ADCCON_MUXSELN_SHIFT) |
 			 (AD5940_ADCPGA_1P5 << AD5940_ADCCON_GNPGA_SHIFT));
 
-	ret = ad5940_spi_read32(priv, AD5940_REG_ADCFILTERCON, &val);
-	if (ret)
-		return ret;
-	val &= AD5940_ADCFILTERCON_AVRGEN;
-	val |= AD5940_ADCRATE_800KHZ;
-	val |= (AD5940_ADCSINC2OSR_667 << AD5940_ADCFILTERCON_SINC2OSR_SHIFT);
-	val |= (AD5940_ADCSINC3OSR_4 << AD5940_ADCFILTERCON_SINC3OSR_SHIFT);
-	val |= (AD5940_ADCAVGNUM_16 << AD5940_ADCFILTERCON_AVRGNUM_SHIFT);
-	val |= AD5940_ADCFILTERCON_LPFBYPEN;
-	ad5940_spi_write(priv, AD5940_REG_ADCFILTERCON, val);
+	{
+		/* Use Band 1 parameters for RTIA calibration (always SINC2NOTCH) */
+		struct ad5940_freq_params cal_params =
+			ad5940_get_freq_params(cal_freqs[0]);
 
-	ret = rtia_cal_afe_ctrl(priv, AD5940_AFECTRL_SINC2NOTCH, true);
-	if (ret)
-		return ret;
+		ret = ad5940_spi_read32(priv, AD5940_REG_ADCFILTERCON, &val);
+		if (ret)
+			return ret;
+		val &= AD5940_ADCFILTERCON_AVRGEN;
+		val |= AD5940_ADCRATE_800KHZ;
+		val |= (cal_params.sinc2osr << AD5940_ADCFILTERCON_SINC2OSR_SHIFT);
+		val |= (cal_params.sinc3osr << AD5940_ADCFILTERCON_SINC3OSR_SHIFT);
+		if (cal_params.dft_src == AD5940_DFTSRC_SINC2NOTCH)
+			val |= AD5940_ADCFILTERCON_LPFBYPEN;
+		ad5940_spi_write(priv, AD5940_REG_ADCFILTERCON, val);
 
-	ad5940_spi_write(priv, AD5940_REG_ADCMIN, 0);
-	ad5940_spi_write(priv, AD5940_REG_ADCMINSM, 0);
-	ad5940_spi_write(priv, AD5940_REG_ADCMAX, 0);
-	ad5940_spi_write(priv, AD5940_REG_ADCMAXSMEN, 0);
+		ret = rtia_cal_afe_ctrl(priv, AD5940_AFECTRL_SINC2NOTCH, true);
+		if (ret)
+			return ret;
 
-	ret = ad5940_spi_read32(priv, AD5940_REG_ADCFILTERCON, &val);
-	if (ret)
-		return ret;
-	val &= ~AD5940_ADCFILTERCON_AVRGEN;
-	ad5940_spi_write(priv, AD5940_REG_ADCFILTERCON, val);
+		ad5940_spi_write(priv, AD5940_REG_ADCMIN, 0);
+		ad5940_spi_write(priv, AD5940_REG_ADCMINSM, 0);
+		ad5940_spi_write(priv, AD5940_REG_ADCMAX, 0);
+		ad5940_spi_write(priv, AD5940_REG_ADCMAXSMEN, 0);
 
-	val = BIT(AD5940_DFTCON_HANNINGEN_SHIFT) |
-	      (AD5940_DFTNUM_8192 << AD5940_DFTCON_DFTNUM_SHIFT) |
-	      (AD5940_DFTSRC_SINC2NOTCH << AD5940_DFTCON_DFTINSEL_SHIFT);
-	ad5940_spi_write(priv, AD5940_REG_DFTCON, val);
+		ret = ad5940_spi_read32(priv, AD5940_REG_ADCFILTERCON, &val);
+		if (ret)
+			return ret;
+		val &= ~AD5940_ADCFILTERCON_AVRGEN;
+		ad5940_spi_write(priv, AD5940_REG_ADCFILTERCON, val);
+
+		val = BIT(AD5940_DFTCON_HANNINGEN_SHIFT) |
+		      (cal_params.dft_num << AD5940_DFTCON_DFTNUM_SHIFT) |
+		      (cal_params.dft_src << AD5940_DFTCON_DFTINSEL_SHIFT);
+		ad5940_spi_write(priv, AD5940_REG_DFTCON, val);
+	}
 
 	ad5940_spi_write(priv, AD5940_REG_STATSCON, 0);
 
@@ -2137,12 +2361,18 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 	{
 		u32 init_buf[128];  /* 128 words = plenty for init sequence */
 		int init_len;
+		struct ad5940_freq_params init_freq_params;
+		u32 init_freq_hz = priv->sweep_en ?
+				   priv->sweep_start_hz : 50000;
+
+		init_freq_params = ad5940_get_freq_params(init_freq_hz);
+		priv->curr_freq_params = init_freq_params;
 
 		init_len = ad5940_bia_gen_init_seq(priv, init_buf,
 						   ARRAY_SIZE(init_buf),
 						   &init_shadow,
-						   priv->sweep_en ?
-						   priv->sweep_start_hz : 50000);
+						   init_freq_hz,
+						   &init_freq_params);
 		if (init_len < 0) {
 			dev_err(dev, "BIA: init sequence generation failed: %d\n",
 				init_len);
@@ -2189,7 +2419,8 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 
 		meas_len = ad5940_bia_gen_measure_seq(priv, meas_buf,
 						      ARRAY_SIZE(meas_buf),
-						      &init_shadow);
+						      &init_shadow,
+						      &priv->curr_freq_params);
 		if (meas_len < 0) {
 			dev_err(dev, "BIA: measure sequence generation failed: %d\n",
 				meas_len);
@@ -2200,14 +2431,19 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 			return -EINVAL;
 		}
 
+		/* Save shadow and SRAM info for band-change sequence regeneration */
+		priv->meas_shadow = init_shadow;
+		priv->meas_seq_addr = meas_seq_addr;
+		priv->meas_seq_len = meas_len;
+
 		dev_info(dev, "BIA: generated measure sequence: %d commands\n",
 			 meas_len);
 
-		/* Debug: print generated sequence */
+		/* Debug: print generated sequence (enable via dynamic_debug) */
 		{
 			int k;
 			for (k = 0; k < meas_len; k++)
-				dev_info(dev, "  seq[%d] = 0x%08x\n", k,
+				dev_dbg(dev, "  seq[%d] = 0x%08x\n", k,
 					 meas_buf[k]);
 		}
 
@@ -2351,9 +2587,13 @@ int ad5940_bia_init(struct ad5940_priv *priv)
 	 * subsystem handles this automatically. No AD5940 register write needed.
 	 */
 
-	/* ---- AppBIAInit Step 17: AFEPwrBW(AFEPWR_LP, AFEBW_250K) ---- */
-	ret = ad5940_spi_write(priv, AD5940_REG_PMBW,
-			       (3 << AD5940_PMBW_SYSBW_SHIFT));
+	/* ---- AppBIAInit Step 17: AFEPwrBW ---- */
+	{
+		u32 pmbw_val = (3 << AD5940_PMBW_SYSBW_SHIFT);
+		if (priv->curr_freq_params.high_pwr)
+			pmbw_val |= AD5940_PMBW_SYSHP;
+		ret = ad5940_spi_write(priv, AD5940_REG_PMBW, pmbw_val);
+	}
 	if (ret)
 		return ret;
 

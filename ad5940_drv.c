@@ -49,17 +49,17 @@ static bool sweep_en = true;
 module_param(sweep_en, bool, 0644);
 MODULE_PARM_DESC(sweep_en, "Enable frequency sweep (default: 1)");
 
-static uint sweep_start_hz = 10;
+static uint sweep_start_hz = 20;
 module_param(sweep_start_hz, uint, 0644);
-MODULE_PARM_DESC(sweep_start_hz, "Sweep start frequency in Hz (default: 10)");
+MODULE_PARM_DESC(sweep_start_hz, "Sweep start frequency in Hz (default: 20)");
 
-static uint sweep_stop_hz = 120;
+static uint sweep_stop_hz = 200;
 module_param(sweep_stop_hz, uint, 0644);
-MODULE_PARM_DESC(sweep_stop_hz, "Sweep stop frequency in Hz (default: 120)");
+MODULE_PARM_DESC(sweep_stop_hz, "Sweep stop frequency in Hz (default: 200)");
 
-static uint sweep_points = 10;
+static uint sweep_points = 12;
 module_param(sweep_points, uint, 0644);
-MODULE_PARM_DESC(sweep_points, "Number of sweep frequency points (default: 10)");
+MODULE_PARM_DESC(sweep_points, "Number of sweep frequency points (default: 12)");
 
 static uint sweep_type = 0;  /* 0=linear, 1=log */
 module_param(sweep_type, uint, 0644);
@@ -439,6 +439,42 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 	}
 
 	/*
+	 * Diagnostic: dump key AFE registers on first few interrupts.
+	 * Uses dev_dbg so output is off by default; enable with:
+	 *   echo 'file ad5940_drv.c +p' > /sys/kernel/debug/dynamic_debug/control
+	 */
+	{
+		static int diag_cnt;
+		if (diag_cnt < 5) {
+			u32 adccon, afecon, wgfcw, filtcon, dftcon;
+
+			adccon = (u32)ad5940_spi_read(priv, AD5940_REG_ADCCON);
+			afecon = (u32)ad5940_spi_read(priv, AD5940_REG_AFECON);
+			wgfcw  = (u32)ad5940_spi_read(priv, AD5940_REG_WGFCW);
+			filtcon = (u32)ad5940_spi_read(priv, AD5940_REG_ADCFILTERCON);
+			dftcon  = (u32)ad5940_spi_read(priv, AD5940_REG_DFTCON);
+
+			dev_dbg(&priv->spi->dev,
+				 "DIAG[%d] ADCCON=0x%x MUXP=%u MUXN=%u PGA=%u | "
+				 "AFECON=0x%x WG=%d ADCPWR=%d ADCCNV=%d DFT=%d SINC2=%d | "
+				 "WGFCW=0x%x(%uHz) | FILTCON=0x%x | DFTCON=0x%x\n",
+				 diag_cnt, adccon,
+				 adccon & 0x3F, (adccon >> 8) & 0x1F,
+				 (adccon >> 16) & 0x7,
+				 afecon,
+				 !!(afecon & AD5940_AFECON_WG),
+				 !!(afecon & AD5940_AFECON_ADCPWR),
+				 !!(afecon & AD5940_AFECON_ADCCNV),
+				 !!(afecon & AD5940_AFECON_DFT),
+				 !!(afecon & AD5940_AFECON_SINC2NOTCH),
+				 wgfcw,
+				 wgfcw ? (u32)div_u64((u64)wgfcw * 16000000, 1 << 26) : 0,
+				 filtcon, dftcon);
+			diag_cnt++;
+		}
+	}
+
+	/*
 	 * Read all available frames from FIFO and push each one
 	 * to the IIO buffer separately (with its own timestamp).
 	 * ADI reads all frames in one FIFORd call then processes;
@@ -457,6 +493,22 @@ static irqreturn_t ad5940_trigger_handler(int irq, void *p)
 
 		/* Fill frequency channel with current measurement frequency */
 		scan.freq = priv->freq_of_data_hz;
+
+		/* Diagnostic: print raw FIFO DFT values (first 10 frames)
+		 * Enable with: echo 'file ad5940_drv.c +p' > .../dynamic_debug/control
+		 */
+		{
+			static int fifo_diag_cnt;
+			if (fifo_diag_cnt < 10) {
+				dev_dbg(&priv->spi->dev,
+					 "FIFO[%d] raw: 0x%08x 0x%08x 0x%08x 0x%08x freq=%u\n",
+					 fifo_diag_cnt,
+					 scan.dft[0], scan.dft[1],
+					 scan.dft[2], scan.dft[3],
+					 scan.freq);
+				fifo_diag_cnt++;
+			}
+		}
 
 		/*
 		 * Fill RTIA calibration channels with the active cal values

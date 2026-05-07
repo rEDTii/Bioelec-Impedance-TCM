@@ -275,6 +275,7 @@
 #define AD5940_DATAFIFOTHRES_HIGHTHRES_SHIFT	16
 
 /* PMBW bits */
+#define AD5940_PMBW_SYSHP			BIT(0)	/* High Power mode for HS DAC/ADC */
 #define AD5940_PMBW_SYSBW_SHIFT			2
 
 /* INTC interrupt source flags */
@@ -524,33 +525,49 @@ static const struct {
  *   Step 2: Voltage across body (ADC MUX = AIN3/AIN2)
  * Each DFT produces 2 FIFO words (Real + Imaginary), total = 4 words.
  *
- * Plan C: Conservative worst-case parameters for low-frequency support.
- * Uses SINC2NOTCH DFT source with large OSR to ensure adequate DFT
- * observation window down to 10Hz.
+ * Three-band DSP parameter lookup for BIA measurement:
+ *
+ *   Band 1 (freq <= 100Hz): SINC2NOTCH, S2OSR=667, S3OSR=4, DFTNUM=8192
+ *     ADC rate ~ 300Hz, 3x Nyquist up to 100Hz (planC-proven)
+ *     wait_clks = 437178780 (~27.3s per DFT)
+ *
+ *   Band 2 (100Hz < freq <= 2kHz): SINC2NOTCH, S2OSR=22, S3OSR=4, DFTNUM=8192
+ *     ADC rate ~ 9091Hz, 3x Nyquist up to 3kHz
+ *     wait_clks = 14419980 (~0.9s per DFT)
+ *
+ *   Band 3 (freq > 2kHz): SINC3, S3OSR=2, DFTNUM=8192, high power
+ *     ADC rate = 400kHz, supports up to ~200kHz (ADI BIA example)
+ *     wait_clks = 327805 (~0.02s per DFT)
+ *
+ * Parameters are returned by ad5940_get_freq_params().
+ * WaitClks is stored in struct ad5940_freq_params.wait_clks.
  *
  * Key fix: WG (waveform generator) is kept running continuously between
  * the two DFT measurements to avoid WG phase reset at low frequencies.
- * At 10Hz, restarting WG causes ~180° phase offset because the second
- * DFT starts from WGPHASE=0 while the first DFT accumulated significant
- * phase. By keeping WG on, both DFTs share the same continuous waveform.
- *
- * WaitClks calculation via AD5940_ClksCalculate():
- *   DataType = DATATYPE_DFT, DftSrc = DFTSRC_SINC2NOTCH, BpNotch = TRUE
- *   DataCount = 1L<<(DFTNUM_8192+2) = 1L<<13 = 8192
- *   ADCSinc3Osr = ADCSINC3OSR_4 (=1) → sinc3osr_table[1] = 4
- *   ADCSinc2Osr = ADCSINC2OSR_667 (=7) → sinc2osr_table[7] = 667
- *   RatioSys2AdcClk = SysClkFreq/AdcClkFreq = 16MHz/16MHz = 1
- *
- *   DATATYPE_SINC2: temp = (8192+1)*667 + 1 = 5464732
- *   DATATYPE_SINC3: temp = ((5464732+2)*4+1)*20*1 = 437178740
- *   DATATYPE_SINC2: temp += 15 → 437178755
- *   DATATYPE_DFT:   temp += 25 → WaitClks = 437178780
- *
- *   DFT observation window = 8192 / (800000/(667*4)) ≈ 27.3 seconds
- *   At 10Hz: ~273 signal periods (>> 8 minimum)
- *   Two DFTs per cycle ≈ 54.7 seconds per measurement
  */
+
+/**
+ * struct ad5940_freq_params - DSP filter settings for a frequency band
+ *
+ * @dft_num:    DFTNUM_xxx register value
+ * @dft_src:    DFTSRC_xxx register value (DFT input source)
+ * @sinc3osr:   ADCSINC3OSR_xxx register value
+ * @sinc2osr:   ADCSINC2OSR_xxx register value
+ * @wait_clks:  Sequencer wait clocks for DFT completion (16MHz clock cycles)
+ * @high_pwr:   High power mode flag (for PMBW configuration)
+ */
+struct ad5940_freq_params {
+	u32	dft_num;
+	u32	dft_src;
+	u32	sinc3osr;
+	u32	sinc2osr;
+	u32	wait_clks;
+	bool	high_pwr;
+};
+
 #define AD5940_BIA_WAIT_CLKS	437178780
+
+struct ad5940_freq_params ad5940_get_freq_params(u32 freq_hz);
 
 /*
  * AFECTRL bit definitions - matching ADI's AFECTRL_* constants.
@@ -583,6 +600,30 @@ static const struct {
  * high-level API flow (AppBIASeqMeasureGen). See ad5940_core.c.
  * The generated commands are written directly to SRAM.
  */
+
+/* ================================================================== */
+/*  struct seq_shadow_regs - shadow register state for sequence gen   */
+/* ================================================================== */
+
+/**
+ * struct seq_shadow_regs - Shadow register state persisted across sequence generation
+ *
+ * ADI's SEQGen uses a static global SeqGenDB whose RegInfo array persists
+ * between AppBIASeqCfgGen() and AppBIASeqMeasureGen() calls. We replicate
+ * this by extracting shadow registers into a separate struct that can be
+ * passed from init sequence generation to measure sequence generation.
+ *
+ * @shadow_afecon:      Shadow of AFECON register (tracked by AFECtrlS)
+ * @shadow_adccon:      Shadow of ADCCON register (tracked by ADCMuxCfgS)
+ * @shadow_bufsencon:   Shadow of BUFSENCON register (tracked by REFCfgS)
+ * @shadow_adcfiltcon:  Shadow of ADCFILTERCON register (tracked by ADCFilterCfgS/DFTCfgS)
+ */
+struct seq_shadow_regs {
+	u32	shadow_afecon;
+	u32	shadow_adccon;
+	u32	shadow_bufsencon;
+	u32	shadow_adcfiltcon;
+};
 
 /* ================================================================== */
 /*  struct ad5940_priv - driver private data                          */
@@ -630,6 +671,7 @@ enum ad5940_sweep_type {
  * @sweep_curr_freq_hz:  frequency currently being measured
  * @sweep_next_freq_hz:  frequency for next WUPT cycle
  * @freq_of_data_hz:     frequency of the most recent FIFO data
+ * @curr_freq_params:    current DSP parameters for the active frequency band
  * @rtia_cal_table:  per-frequency RTIA calibration results
  */
 struct ad5940_priv {
@@ -667,6 +709,10 @@ struct ad5940_priv {
 	u32			sweep_curr_freq_hz;
 	u32			sweep_next_freq_hz;
 	u32			freq_of_data_hz;
+	struct ad5940_freq_params	curr_freq_params;
+	struct seq_shadow_regs		meas_shadow;	/* shadow regs for measure seq regeneration */
+	u32				meas_seq_addr;	/* SRAM start address of measure sequence */
+	int				meas_seq_len;	/* command count of measure sequence */
 	struct ad5940_rtia_cal_result rtia_cal_table[AD5940_MAX_SWEEP_POINTS];
 };
 

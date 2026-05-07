@@ -97,6 +97,10 @@ typedef struct {
 	float resistance;	/* Real part R in Ohms */
 	float reactance;	/* Imaginary part X in Ohms */
 	uint32_t freq_hz;	/* Excitation frequency in Hz */
+	int32_t curr_real;	/* Raw DFT: current channel real part (18-bit signed) */
+	int32_t curr_imag;	/* Raw DFT: current channel imaginary part */
+	int32_t volt_real;	/* Raw DFT: voltage channel real part */
+	int32_t volt_imag;	/* Raw DFT: voltage channel imaginary part */
 } bia_sample_t;
 
 /*
@@ -147,6 +151,10 @@ static void compute_impedance(int32_t curr_real, int32_t curr_imag,
 	result->resistance = z_mag * cosf(z_phase);
 	result->reactance  = z_mag * sinf(z_phase);
 	result->freq_hz    = freq_hz;
+	result->curr_real  = curr_real;
+	result->curr_imag  = curr_imag;
+	result->volt_real  = volt_real;
+	result->volt_imag  = volt_imag;
 }
 
 /* ------------------------------------------------------------------ */
