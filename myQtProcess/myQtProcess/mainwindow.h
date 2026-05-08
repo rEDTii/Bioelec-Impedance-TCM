@@ -4,14 +4,32 @@
 #include <QMainWindow>
 #include <QSocketNotifier>
 #include <QMap>
+#include <QProcess>
+#include <QPushButton>
+#include <QLabel>
 #include <QtCharts/QChartView>
 #include <QtCharts/QChart>
 #include <QtCharts/QLineSeries>
 #include <QtCharts/QLogValueAxis>
 #include <QtCharts/QValueAxis>
 
-/* Must match ad5940_bia_demo.c / dummy_Qt.c */
+/* Must match ad5940_bia_demo.c */
 #define BIA_SOCK_PATH  "/tmp/bia_sample.sock"
+
+/* IIO sysfs paths — may be device0 or device1, auto-detected */
+#define IIO_DEVICE_GLOB  "/sys/bus/iio/devices/iio:device*"
+
+/*
+ * Search paths for ad5940_bia_demo, tried in order.
+ * Edit if your deployment puts the binary elsewhere.
+ */
+static const char * const DEMO_BIN_PATHS[] = {
+    "/mydrivers/ad5940_bia_demo", // 开发时使用的目录
+    "/usr/local/bin/ad5940_bia_demo",
+    "/usr/bin/ad5940_bia_demo",
+    "/opt/ad5940/ad5940_bia_demo",
+    "./ad5940_bia_demo",
+};
 
 QT_CHARTS_USE_NAMESPACE
 
@@ -40,12 +58,21 @@ public:
     ~MainWindow();
 
 private slots:
+    void onToggleButton();
     void onDataReady();
+    void onDemoFinished(int exitCode, QProcess::ExitStatus status);
 
 private:
-    void initSocket();
     void initChart();
+    void initSocket();
     void refreshChart();
+    void startAcquisition();
+    void stopAcquisition();
+    void setAcquiring(bool on);
+
+    int  readSweepPoints();
+    QString findIioDevice();
+    bool enableIioBuffer(bool enable);
 
     Ui::MainWindow *ui;
 
@@ -64,5 +91,14 @@ private:
     QLogValueAxis *m_xAxis = nullptr;
     QValueAxis *m_yMagAxis = nullptr;
     QValueAxis *m_yPhaseAxis = nullptr;
+
+    /* Acquisition control */
+    QPushButton *m_btnToggle = nullptr;
+    QLabel *m_statusLabel = nullptr;
+    QProcess *m_demoProcess = nullptr;
+    bool m_acquiring = false;
+    int m_sweepPoints = 0;      /* 0 = not yet read */
+    int m_receivedPoints = 0;   /* unique freq points received this round */
+    QString m_iioDevicePath;    /* e.g. /sys/bus/iio/devices/iio:device1 */
 };
 #endif // MAINWINDOW_H
