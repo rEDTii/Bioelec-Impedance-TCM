@@ -61,7 +61,7 @@
  * run the Rtia calibration procedure and substitute the calibrated value.
  * The actual calibrated values are read from the driver via IIO channels.
  */
-#define RTIA_NOMINAL_OHM	5000.0f	/* matches AD5940_BIA_RTIA_SEL = HSTIARTIA_5K */
+// #define RTIA_NOMINAL_OHM	5000.0f	/* matches AD5940_BIA_RTIA_SEL = HSTIARTIA_5K */
 
 /* Each measurement cycle produces 4 FIFO words + 1 frequency + 2 RTIA */
 #define NUM_DFT_CHANNELS	4

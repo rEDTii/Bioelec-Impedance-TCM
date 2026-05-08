@@ -61,9 +61,9 @@ static uint sweep_points = 15;
 module_param(sweep_points, uint, 0644);
 MODULE_PARM_DESC(sweep_points, "Number of sweep frequency points (default: 15)");
 
-static uint sweep_type = 0;  /* 0=linear, 1=log */
+static uint sweep_type = 2;  /* 0=linear, 1=log, 2=custom */
 module_param(sweep_type, uint, 0644);
-MODULE_PARM_DESC(sweep_type, "Sweep type: 0=linear, 1=logarithmic (default: 0)");
+MODULE_PARM_DESC(sweep_type, "Sweep type: 0=linear, 1=logarithmic, 2=custom table (default: 2)");
 
 /* ------------------------------------------------------------------ */
 /*  IIO channel definitions – DFT impedance mode (BIA 4-wire)        */
@@ -664,18 +664,38 @@ static int ad5940_probe(struct spi_device *spi)
 
 	/* Configure sweep from module parameters */
 	priv->sweep_en = sweep_en;
-	priv->sweep_type = sweep_type ? AD5940_SWEEP_LOG : AD5940_SWEEP_LINEAR;
+	switch (sweep_type) {
+	case 2:
+		priv->sweep_type = AD5940_SWEEP_CUSTOM;
+		break;
+	case 1:
+		priv->sweep_type = AD5940_SWEEP_LOG;
+		break;
+	default:
+		priv->sweep_type = AD5940_SWEEP_LINEAR;
+		break;
+	}
 	priv->sweep_start_hz = sweep_start_hz;
 	priv->sweep_stop_hz = sweep_stop_hz;
-	/* 钳位(clamp): 将 sweep_points 限制在 [1, AD5940_MAX_SWEEP_POINTS] 范围内 */
-	priv->sweep_points = clamp_val(sweep_points, 1,
-				       AD5940_MAX_SWEEP_POINTS); 
+	if (priv->sweep_type == AD5940_SWEEP_CUSTOM) {
+		/* Custom table: points = table size, ignore start/stop/points */
+		priv->sweep_points = AD5940_BIA_CUSTOM_FREQ_COUNT;
+	} else {
+		/* 钳位(clamp): 将 sweep_points 限制在 [1, AD5940_MAX_SWEEP_POINTS] 范围内 */
+		priv->sweep_points = clamp_val(sweep_points, 1,
+					       AD5940_MAX_SWEEP_POINTS);
+	}
 	if (priv->sweep_en) {
-		dev_info(dev, "Sweep: %uHz - %uHz, %u points, %s\n",
-			 priv->sweep_start_hz, priv->sweep_stop_hz,
-			 priv->sweep_points,
-			 priv->sweep_type == AD5940_SWEEP_LOG ?
-				"log" : "linear");
+		if (priv->sweep_type == AD5940_SWEEP_CUSTOM) {
+			dev_info(dev, "Sweep: custom table, %u points\n",
+				 priv->sweep_points);
+		} else {
+			dev_info(dev, "Sweep: %uHz - %uHz, %u points, %s\n",
+				 priv->sweep_start_hz, priv->sweep_stop_hz,
+				 priv->sweep_points,
+				 priv->sweep_type == AD5940_SWEEP_LOG ?
+					"log" : "linear");
+		}
 	}
 
 	/* Setup SPI: CPOL=0, CPHA=0 (SPI mode 0) */

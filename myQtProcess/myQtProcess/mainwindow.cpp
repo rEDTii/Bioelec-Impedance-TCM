@@ -60,11 +60,13 @@ void MainWindow::initChart()
     m_phaseSeries->setPen(phasePen);
     m_chart->addSeries(m_phaseSeries);
 
-    /* ---- X axis — linear frequency ---- */
-    m_xAxis = new QValueAxis();
+    /* ---- X axis — logarithmic frequency ---- */
+    m_xAxis = new QLogValueAxis();
     m_xAxis->setTitleText("Frequency (Hz)");
-    m_xAxis->setRange(1e3, 2e5);
+    m_xAxis->setBase(10);
+    m_xAxis->setRange(100, 200000);
     m_xAxis->setLabelFormat("%.0f");
+    m_xAxis->setMinorTickCount(8);
     m_chart->addAxis(m_xAxis, Qt::AlignBottom);
     m_magSeries->attachAxis(m_xAxis);
     m_phaseSeries->attachAxis(m_xAxis);
@@ -236,8 +238,9 @@ void MainWindow::refreshChart()
     m_phaseSeries->attachAxis(m_xAxis);
     m_phaseSeries->attachAxis(m_yPhaseAxis);
 
-    /* Auto-adjust axes */
-    m_xAxis->setRange(freqMin * 0.8, freqMax * 1.25);
+    /* Auto-adjust X axis (log scale — ensure positive minimum) */
+    if (freqMin < 1.0) freqMin = 1.0;
+    m_xAxis->setRange(freqMin * 0.5, freqMax * 2.0);
 
     /* |Z| Y-axis: min=0 fixed, max=dynamic with 5% padding */
     m_yMagAxis->setRange(0, magMax * 1.05);

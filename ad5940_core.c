@@ -1234,6 +1234,11 @@ u32 ad5940_sweep_calc_freq(u32 start_hz, u32 stop_hz, u32 points,
 		return start_hz;
 
 	switch (type) {
+	case AD5940_SWEEP_CUSTOM:
+		/* Custom: return frequency from the hardcoded table */
+		if (index >= ARRAY_SIZE(ad5940_custom_freq_table))
+			index = ARRAY_SIZE(ad5940_custom_freq_table) - 1;
+		return ad5940_custom_freq_table[index];
 	case AD5940_SWEEP_LOG:
 		/* Logarithmic: freq[i] = start * (stop/start)^(i/(points-1))
 		 * Compute via incremental multiplication in Q16 fixed-point.
@@ -2744,11 +2749,17 @@ int ad5940_bia_start(struct ad5940_priv *priv)
 	/* Initialize sweep measurement state */
 	if (priv->sweep_en) {
 		priv->sweep_index = 0;
-		priv->sweep_curr_freq_hz = priv->sweep_start_hz;
+		if (priv->sweep_type == AD5940_SWEEP_CUSTOM) {
+			/* Custom: first freq from table, ignore start/stop */
+			priv->sweep_curr_freq_hz =
+				ad5940_custom_freq_table[0];
+		} else {
+			priv->sweep_curr_freq_hz = priv->sweep_start_hz;
+		}
 		priv->sweep_next_freq_hz = ad5940_sweep_calc_freq(
 			priv->sweep_start_hz, priv->sweep_stop_hz,
 			priv->sweep_points, priv->sweep_type, 1);
-		priv->freq_of_data_hz = priv->sweep_start_hz;
+		priv->freq_of_data_hz = priv->sweep_curr_freq_hz;
 	} else {
 		priv->freq_of_data_hz = 50000;
 	}

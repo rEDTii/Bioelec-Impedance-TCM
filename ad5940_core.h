@@ -714,7 +714,35 @@ struct ad5940_rtia_cal_result {
 enum ad5940_sweep_type {
 	AD5940_SWEEP_LINEAR = 0,
 	AD5940_SWEEP_LOG,
+	AD5940_SWEEP_CUSTOM,
 };
+
+/*
+ * Custom frequency table for AD5940_SWEEP_CUSTOM mode.
+ * Edit this array to specify exact frequency points to sweep.
+ * AD5940_BIA_CUSTOM_FREQ_COUNT is auto-calculated.
+ *
+ * When sweep_type=2 (AD5940_SWEEP_CUSTOM), the driver sweeps ONLY
+ * these frequencies, ignoring sweep_start_hz/sweep_stop_hz.
+ * sweep_points is auto-set to the array size.
+ */
+#define AD5940_BIA_CUSTOM_FREQ_TABLE {			\
+	1,		/*   1 Hz  */			\
+	10,		/*  10 Hz  */			\
+	25,		/*  25 Hz  */			\
+	50,		/*  50 Hz  */			\
+	100,		/* 100 Hz  */			\
+	200,		/* 200 Hz  */			\
+	1000,		/*   1 kHz */			\
+	10000,		/*  10 kHz */			\
+	40000,		/*  40 kHz */			\
+	50000,		/*  50 kHz */			\
+	100000,		/* 100 kHz */			\
+	200000,		/* 200 kHz */			\
+}
+
+static const u32 ad5940_custom_freq_table[] = AD5940_BIA_CUSTOM_FREQ_TABLE;
+#define AD5940_BIA_CUSTOM_FREQ_COUNT	ARRAY_SIZE(ad5940_custom_freq_table)
 
 /**
  * struct ad5940_priv - AD5940 driver private data
