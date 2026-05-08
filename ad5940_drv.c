@@ -49,17 +49,17 @@ static bool sweep_en = true;
 module_param(sweep_en, bool, 0644);
 MODULE_PARM_DESC(sweep_en, "Enable frequency sweep (default: 1)");
 
-static uint sweep_start_hz = 20;
+static uint sweep_start_hz = 10;
 module_param(sweep_start_hz, uint, 0644);
-MODULE_PARM_DESC(sweep_start_hz, "Sweep start frequency in Hz (default: 20)");
+MODULE_PARM_DESC(sweep_start_hz, "Sweep start frequency in Hz (default: 10)");
 
 static uint sweep_stop_hz = 200;
 module_param(sweep_stop_hz, uint, 0644);
 MODULE_PARM_DESC(sweep_stop_hz, "Sweep stop frequency in Hz (default: 200)");
 
-static uint sweep_points = 12;
+static uint sweep_points = 15;
 module_param(sweep_points, uint, 0644);
-MODULE_PARM_DESC(sweep_points, "Number of sweep frequency points (default: 12)");
+MODULE_PARM_DESC(sweep_points, "Number of sweep frequency points (default: 15)");
 
 static uint sweep_type = 0;  /* 0=linear, 1=log */
 module_param(sweep_type, uint, 0644);

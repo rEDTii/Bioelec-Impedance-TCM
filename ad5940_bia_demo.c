@@ -31,7 +31,7 @@
  *   Impedance calculation (from ADI BodyImpedance.c AppBIAISR()):
  *     |Z| = |V| / |I| * Rtia
  *     angle(Z) = angle(V) - angle(I)
- *   where Rtia is the HSTIA feedback resistor (default 1kOhm for HSTIARTIA_1K).
+ *   where Rtia is the HSTIA feedback resistor (configured via AD5940_BIA_RTIA_SEL).
  */
 
 #include <stdio.h>
@@ -52,15 +52,16 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * Rtia: HSTIA feedback resistor value in Ohms.
- * HstiaRtiaSel = HSTIARTIA_1K → Rtia = 1000 Ohm
+ * Rtia: HSTIA feedback resistor nominal value in Ohms.
+ * Must match AD5940_BIA_RTIA_SEL / AD5940_BIA_RTIA_OHM in kernel driver.
  *
  * Note: ADI's AppBIAISR() uses RtiaCurrValue[] from AD5940_HSRtiaCal()
  * which returns the calibrated Rtia (magnitude + phase). For this demo
- * we use the nominal 1kOhm value. For precision measurements, you should
+ * we use the nominal value. For precision measurements, you should
  * run the Rtia calibration procedure and substitute the calibrated value.
+ * The actual calibrated values are read from the driver via IIO channels.
  */
-#define RTIA_NOMINAL_OHM	1000.0f
+#define RTIA_NOMINAL_OHM	5000.0f	/* matches AD5940_BIA_RTIA_SEL = HSTIARTIA_5K */
 
 /* Each measurement cycle produces 4 FIFO words + 1 frequency + 2 RTIA */
 #define NUM_DFT_CHANNELS	4

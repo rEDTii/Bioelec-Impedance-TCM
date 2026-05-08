@@ -656,10 +656,12 @@ static int ad5940_bia_gen_init_seq(struct ad5940_priv *priv,
 	 */
 	seq_write_reg(&sg, AD5940_REG_HSTIACON, 0x00);
 
-	/* HSRTIACON: Ctia=16<<5=0x200, RtiaSel=HSTIARTIA_1K=1 → 0x201 */
+	/* HSRTIACON: Ctia=AD5940_BIA_RTIA_CTIA, RtiaSel=AD5940_BIA_RTIA_SEL
+	 * Configurable via AD5940_BIA_RTIA_SEL / AD5940_BIA_RTIA_CTIA macros.
+	 */
 	seq_write_reg(&sg, AD5940_REG_HSRTIACON,
-		      (16 << AD5940_HSRTIACON_CTIACON_SHIFT) |
-		      AD5940_HSTIARTIA_1K);
+		      (AD5940_BIA_RTIA_CTIA << AD5940_HSRTIACON_CTIACON_SHIFT) |
+		      AD5940_BIA_RTIA_SEL);
 
 	/* DE0RESCON: DeRtia=OPEN(0x1F<<3=0xF8), DeRload=OPEN(=5) → 0xFD */
 	seq_write_reg(&sg, AD5940_REG_DE0RESCON,
@@ -1145,6 +1147,45 @@ struct ad5940_freq_params ad5940_get_freq_params(u32 freq_hz)
 }
 EXPORT_SYMBOL_GPL(ad5940_get_freq_params);
 
+/**
+ * ad5940_freq_band_id - Map a frequency to its band ID
+ * @freq_hz: frequency in Hz
+ *
+ * Band 0: freq <= 100Hz   (SINC2NOTCH, S2OSR=667, S3OSR=4)
+ * Band 1: 100Hz < freq <= 2kHz (SINC2NOTCH, S2OSR=22, S3OSR=4)
+ * Band 2: freq > 2kHz    (SINC3, S3OSR=2, high power)
+ *
+ * Return: band ID (0, 1, or 2)
+ */
+static int ad5940_freq_band_id(u32 freq_hz)
+{
+	if (freq_hz <= 100)
+		return 0;
+	else if (freq_hz <= 2000)
+		return 1;
+	else
+		return 2;
+}
+
+/**
+ * ad5940_band_representative_freq - Get representative calibration frequency for a band
+ * @band_id: band ID (0, 1, or 2)
+ *
+ * Returns a frequency near the high end of the band for best DFT SNR,
+ * since wait_clks is constant within a band (determined by DSP params).
+ *
+ * Return: representative frequency in Hz
+ */
+static u32 ad5940_band_representative_freq(int band_id)
+{
+	switch (band_id) {
+	case 0:  return 80;		/* Band 0: ≤100Hz, use 80Hz */
+	case 1:  return 1000;		/* Band 1: 100Hz~2kHz, use 1kHz */
+	case 2:  return 50000;		/* Band 2: >2kHz, use 50kHz (ADI default) */
+	default: return 50000;
+	}
+}
+
 /* ================================================================== */
 /*  Frequency sweep helpers                                            */
 /* ================================================================== */
@@ -1389,7 +1430,7 @@ int ad5940_bia_sweep_step(struct ad5940_priv *priv)
 		return ret;
 
 	/* Update RTIA calibration for the upcoming measurement frequency */
-	priv->rtia_cal = priv->rtia_cal_table[priv->sweep_index];
+	priv->rtia_cal = priv->band_cal_table[priv->sweep_band_map[priv->sweep_index]];
 
 	return 0;
 }
@@ -1550,21 +1591,37 @@ static s32 rtia_cal_atan2_mdeg(s64 y, s64 x)
 }
 
 /**
- * ad5940_bia_rtia_cal - Perform RTIA calibration
+ * ad5940_bia_rtia_cal - Perform RTIA calibration (per-band)
  * @priv: driver private data
  *
- * Faithfully replicates ADI's AppBIARtiaCal() → AD5940_HSRtiaCal() flow.
+ * Faithfully replicates ADI's AppBIARtiaCal() → AD5940_HSRtiaCal() flow,
+ * but optimizes calibration from per-frequency to per-band:
  *
- * When sweep is disabled: single-frequency calibration at 50kHz.
- * When sweep is enabled: calibrates at each sweep frequency point,
- * storing results in rtia_cal_table[] for per-frequency correction.
+ *   - RTIA is a physical resistor whose value doesn't change with frequency.
+ *   - Frequency-dependent variation (from CTIA parasitics, PCB traces) is
+ *     dominated by the DSP filter configuration, which is constant within
+ *     each band.
+ *   - Per-band calibration captures band-to-band differences while
+ *     dramatically reducing startup time for wide-band sweeps:
+ *       e.g. 100-point 10Hz-200kHz sweep: ~10min → ~56s
+ *
+ * Band definitions match ad5940_get_freq_params():
+ *   Band 0: freq ≤ 100Hz   (SINC2NOTCH, S2OSR=667, S3OSR=4)
+ *   Band 1: 100Hz < freq ≤ 2kHz (SINC2NOTCH, S2OSR=22, S3OSR=4)
+ *   Band 2: freq > 2kHz    (SINC3, S3OSR=2, high power)
+ *
+ * Representative calibration frequencies (chosen near band high end
+ * for best DFT SNR; wait_clks is constant within a band):
+ *   Band 0: 80Hz, Band 1: 1000Hz, Band 2: 50000Hz
+ *
+ * When sweep is disabled: single-frequency calibration at 50kHz (Band 2).
  *
  * Return: 0 on success, negative errno on failure
  */
 int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 {
 	struct device *dev = &priv->spi->dev;
-	int ret, i;
+	int ret, i, band_id;
 	u32 val, intc1_saved;
 	s32 dft_rcal_real, dft_rcal_imag;
 	s32 dft_rtia_real, dft_rtia_imag;
@@ -1573,31 +1630,47 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 	u32 wg_amp_word;
 	u32 freq_word;
 	u32 full_range_mv;
-	u32 cal_count;
-	u32 cal_freqs[AD5940_MAX_SWEEP_POINTS];
 
-	/* ---- BIA RTIA calibration parameters ---- */
-	/* Matching AppBIACfg defaults used in AppBIARtiaCal() */
-	static const u32 hp_rtia_table[] = {
-		200, 1000, 5000, 10000, 20000, 40000, 80000, 160000
-	};
-	const u32 rcal_ohm = 10000;	/* RcalVal = 10kΩ */
-	const u32 rtia_sel = AD5940_HSTIARTIA_1K;
-	const u32 rtia_val = hp_rtia_table[rtia_sel]; /* 1000Ω */
-	const u32 ctia_val = 16;	/* CtiaSel */
+	/* ---- RTIA configuration (from ad5940_core.h macros) ---- */
+	const u32 rcal_ohm = AD5940_BIA_RCAL_OHM;	/* RCAL on PCB */
+	const u32 rtia_sel = AD5940_BIA_RTIA_SEL;
+	const u32 rtia_val = AD5940_BIA_RTIA_OHM;
+	const u32 ctia_val = AD5940_BIA_RTIA_CTIA;
 	const u32 sysclk_hz = 16000000; /* SysClkFreq = 16MHz */
 
-	/* Determine calibration frequency set */
+	/* ---- Phase 0: Build band map and identify active bands ---- */
+	bool band_active[AD5940_MAX_FREQ_BANDS] = { false };
+	int active_bands[AD5940_MAX_FREQ_BANDS];
+	int num_active_bands = 0;
+	int first_active_band = -1;
+
 	if (priv->sweep_en) {
-		cal_count = priv->sweep_points;
-		for (i = 0; i < cal_count; i++)
-			cal_freqs[i] = ad5940_sweep_calc_freq(
+		for (i = 0; i < priv->sweep_points; i++) {
+			u32 freq = ad5940_sweep_calc_freq(
 				priv->sweep_start_hz, priv->sweep_stop_hz,
 				priv->sweep_points, priv->sweep_type, i);
+			int bid = ad5940_freq_band_id(freq);
+
+			priv->sweep_band_map[i] = bid;
+			if (!band_active[bid]) {
+				band_active[bid] = true;
+				active_bands[num_active_bands++] = bid;
+			}
+		}
 	} else {
-		cal_count = 1;
-		cal_freqs[0] = 50000;	/* SinFreq = 50kHz */
+		/* Single-frequency: Band 2 at 50kHz */
+		int bid = ad5940_freq_band_id(50000);
+
+		priv->sweep_band_map[0] = bid;
+		band_active[bid] = true;
+		active_bands[0] = bid;
+		num_active_bands = 1;
 	}
+
+	first_active_band = active_bands[0];
+
+	dev_info(dev, "RTIA cal: %d active band(s) out of %d\n",
+		 num_active_bands, AD5940_MAX_FREQ_BANDS);
 
 	/* ---- Phase 1: Parameter calculation ---- */
 
@@ -1630,8 +1703,8 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 	if (wg_amp_word > 0x7FF)
 		wg_amp_word = 0x7FF;
 
-	dev_info(dev, "RTIA cal: ExcitVolt=%umVpp, WgAmp=0x%03x, cal_points=%d\n",
-		 excit_volt_mv, wg_amp_word, cal_count);
+	dev_info(dev, "RTIA cal: ExcitVolt=%umVpp, WgAmp=0x%03x, bands=%d\n",
+		 excit_volt_mv, wg_amp_word, num_active_bands);
 
 	/* ---- Phase 2: AFE hardware configuration (done once) ---- */
 
@@ -1679,7 +1752,8 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 	val = (ctia_val << AD5940_HSRTIACON_CTIACON_SHIFT) | rtia_sel;
 	ad5940_spi_write(priv, AD5940_REG_HSRTIACON, val);
 
-	ad5940_spi_write(priv, AD5940_REG_DE0RESCON, 0x95);
+	ad5940_spi_write(priv, AD5940_REG_DE0RESCON,
+			 (AD5940_HSTIADERTIA_TODE << 3) | AD5940_HSTIADERLOAD_OPEN);
 
 	/* Switch matrix: D=RCAL0, P=RCAL0, N=RCAL1, T=RCAL1|TRTIA|AIN1 */
 	ad5940_spi_write(priv, AD5940_REG_DSWFULLCON, AD5940_SWD_RCAL0);
@@ -1698,48 +1772,11 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 	      AD5940_WGCON_DACGAINCAL | AD5940_WGCON_DACOFFSETCAL;
 	ad5940_spi_write(priv, AD5940_REG_WGCON, val);
 
-	/* 2e: DSPCfgS - Configure DSP */
+	/* 2e: ADCCON - MUX to P_NODE/N_NODE for RCAL measurement, PGA=1.5x */
 	ad5940_spi_write(priv, AD5940_REG_ADCCON,
 			 AD5940_ADCMUXP_P_NODE |
 			 (AD5940_ADCMUXN_N_NODE << AD5940_ADCCON_MUXSELN_SHIFT) |
 			 (AD5940_ADCPGA_1P5 << AD5940_ADCCON_GNPGA_SHIFT));
-
-	{
-		/* Use Band 1 parameters for RTIA calibration (always SINC2NOTCH) */
-		struct ad5940_freq_params cal_params =
-			ad5940_get_freq_params(cal_freqs[0]);
-
-		ret = ad5940_spi_read32(priv, AD5940_REG_ADCFILTERCON, &val);
-		if (ret)
-			return ret;
-		val &= AD5940_ADCFILTERCON_AVRGEN;
-		val |= AD5940_ADCRATE_800KHZ;
-		val |= (cal_params.sinc2osr << AD5940_ADCFILTERCON_SINC2OSR_SHIFT);
-		val |= (cal_params.sinc3osr << AD5940_ADCFILTERCON_SINC3OSR_SHIFT);
-		if (cal_params.dft_src == AD5940_DFTSRC_SINC2NOTCH)
-			val |= AD5940_ADCFILTERCON_LPFBYPEN;
-		ad5940_spi_write(priv, AD5940_REG_ADCFILTERCON, val);
-
-		ret = rtia_cal_afe_ctrl(priv, AD5940_AFECTRL_SINC2NOTCH, true);
-		if (ret)
-			return ret;
-
-		ad5940_spi_write(priv, AD5940_REG_ADCMIN, 0);
-		ad5940_spi_write(priv, AD5940_REG_ADCMINSM, 0);
-		ad5940_spi_write(priv, AD5940_REG_ADCMAX, 0);
-		ad5940_spi_write(priv, AD5940_REG_ADCMAXSMEN, 0);
-
-		ret = ad5940_spi_read32(priv, AD5940_REG_ADCFILTERCON, &val);
-		if (ret)
-			return ret;
-		val &= ~AD5940_ADCFILTERCON_AVRGEN;
-		ad5940_spi_write(priv, AD5940_REG_ADCFILTERCON, val);
-
-		val = BIT(AD5940_DFTCON_HANNINGEN_SHIFT) |
-		      (cal_params.dft_num << AD5940_DFTCON_DFTNUM_SHIFT) |
-		      (cal_params.dft_src << AD5940_DFTCON_DFTINSEL_SHIFT);
-		ad5940_spi_write(priv, AD5940_REG_DFTCON, val);
-	}
 
 	ad5940_spi_write(priv, AD5940_REG_STATSCON, 0);
 
@@ -1747,24 +1784,100 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 	ret = rtia_cal_afe_ctrl(priv,
 		AD5940_AFECTRL_HSTIAPWR | AD5940_AFECTRL_INAMPPWR |
 		AD5940_AFECTRL_EXTBUFPWR | AD5940_AFECTRL_DACREFPWR |
-		AD5940_AFECTRL_HSDACPWR | AD5940_AFECTRL_SINC2NOTCH,
+		AD5940_AFECTRL_HSDACPWR,
 		true);
 	if (ret)
 		return ret;
 
-	/* ---- Phase 3-6: Loop over calibration frequencies ---- */
-	for (i = 0; i < cal_count; i++) {
-		const u32 freq_hz = cal_freqs[i];
+	/* ---- Phase 3: Per-band calibration loop ---- */
+	priv->num_active_bands = num_active_bands;
 
-		/* Update WGFCW for this frequency point */
+	for (i = 0; i < num_active_bands; i++) {
+		struct ad5940_freq_params cal_params;
+		u32 freq_hz;
+		s64 denom, real_num, imag_num;
+		s64 rtia_real_mohm, rtia_imag_mohm;
+
+		band_id = active_bands[i];
+		freq_hz = ad5940_band_representative_freq(band_id);
+		cal_params = ad5940_get_freq_params(freq_hz);
+
+		dev_info(dev, "RTIA cal band %d [%d/%d]: rep_freq=%uHz\n",
+			 band_id, i + 1, num_active_bands, freq_hz);
+
+		/* 3a: Configure DSP for this band
+		 *
+		 * CRITICAL: SINC2NOTCH and DFT must be disabled before changing
+		 * ADCFILTERCON or DFTCON.  Changing filter parameters while the
+		 * DSP block is actively running can leave the hardware in an
+		 * inconsistent state, causing DFT to never complete (DFTRDY
+		 * timeout).  This matches ADI's practice of disabling all AFE
+		 * modules (AFECTRL_ALL = bFALSE) before calling DSPCfgS().
+		 */
+		{
+			u32 pmbw_val;
+
+			/* Disable SINC2NOTCH and DFT before reconfiguring filters */
+			rtia_cal_afe_ctrl(priv,
+				AD5940_AFECTRL_SINC2NOTCH | AD5940_AFECTRL_DFT,
+				false);
+
+			/* Update PMBW for power mode */
+			pmbw_val = (3 << AD5940_PMBW_SYSBW_SHIFT);
+
+			if (cal_params.high_pwr)
+				pmbw_val |= AD5940_PMBW_SYSHP;
+			ad5940_spi_write(priv, AD5940_REG_PMBW, pmbw_val);
+
+			/* ADCFILTERCON: S2OSR, S3OSR, ADCRATE, LPFBYPEN
+			 * Build from scratch (like ADI's ADCFilterCfgS):
+			 *   - Keep AVRGEN off (don't temporarily enable it)
+			 *   - Set ADCRATE, S2OSR, S3OSR, LPFBYPEN
+			 */
+			val = AD5940_ADCRATE_800KHZ;
+			val |= (cal_params.sinc2osr <<
+				AD5940_ADCFILTERCON_SINC2OSR_SHIFT);
+			val |= (cal_params.sinc3osr <<
+				AD5940_ADCFILTERCON_SINC3OSR_SHIFT);
+			if (cal_params.dft_src == AD5940_DFTSRC_SINC2NOTCH)
+				val |= AD5940_ADCFILTERCON_LPFBYPEN;
+			ad5940_spi_write(priv, AD5940_REG_ADCFILTERCON, val);
+
+			ad5940_spi_write(priv, AD5940_REG_ADCMIN, 0);
+			ad5940_spi_write(priv, AD5940_REG_ADCMINSM, 0);
+			ad5940_spi_write(priv, AD5940_REG_ADCMAX, 0);
+			ad5940_spi_write(priv, AD5940_REG_ADCMAXSMEN, 0);
+
+			/* DFTCON: Hanning window, DFTNUM, DFTSRC */
+			val = BIT(AD5940_DFTCON_HANNINGEN_SHIFT) |
+			      (cal_params.dft_num <<
+			       AD5940_DFTCON_DFTNUM_SHIFT) |
+			      (cal_params.dft_src <<
+			       AD5940_DFTCON_DFTINSEL_SHIFT);
+			ad5940_spi_write(priv, AD5940_REG_DFTCON, val);
+
+			/* Re-enable SINC2NOTCH for bands that use it
+			 * (must be after ADCFILTERCON write)
+			 */
+			if (cal_params.dft_src == AD5940_DFTSRC_SINC2NOTCH) {
+				ret = rtia_cal_afe_ctrl(priv,
+					AD5940_AFECTRL_SINC2NOTCH, true);
+				if (ret)
+					goto restore_intc;
+			}
+		}
+
+		/* 3b: Set WGFCW for representative frequency */
 		freq_word = ad5940_wg_freq_word_cal(freq_hz, sysclk_hz);
 		ad5940_spi_write(priv, AD5940_REG_WGFCW, freq_word);
 
-		if (cal_count > 1)
-			dev_info(dev, "RTIA cal [%d/%d]: freq=%uHz, FreqWord=0x%05x\n",
-				 i + 1, cal_count, freq_hz, freq_word);
+		/* ---- 3c: Measure V_Rcal ---- */
+		/* Ensure ADC MUX is on P_NODE/N_NODE for RCAL path */
+		ret = rtia_cal_adc_mux_cfg(priv,
+			AD5940_ADCMUXP_P_NODE, AD5940_ADCMUXN_N_NODE);
+		if (ret)
+			goto restore_intc;
 
-		/* ---- Phase 3: Measure V_Rcal ---- */
 		ret = rtia_cal_afe_ctrl(priv,
 			AD5940_AFECTRL_WG | AD5940_AFECTRL_ADCPWR, true);
 		if (ret)
@@ -1772,9 +1885,7 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 
 		usleep_range(250, 300);
 
-		/* Clear stale DFTRDY before starting new conversion
-		 * (matching ADI's AD5940_INTCClrFlag before ADCCNV enable)
-		 */
+		/* Clear stale DFTRDY before starting new conversion */
 		ad5940_spi_write(priv, AD5940_REG_INTCCLR,
 				 AD5940_AFEINTSRC_DFTRDY);
 
@@ -1785,8 +1896,8 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 
 		ret = rtia_cal_wait_dft_ready(priv, 35000);
 		if (ret) {
-			dev_err(dev, "RTIA cal: V_Rcal DFTRDY timeout at %uHz\n",
-				freq_hz);
+			dev_err(dev, "RTIA cal: V_Rcal DFTRDY timeout at %uHz (band %d)\n",
+				freq_hz, band_id);
 			goto restore_intc;
 		}
 
@@ -1806,7 +1917,7 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 			dft_rcal_imag = (s32)tmp_i;
 		}
 
-		/* ---- Phase 4: Measure V_Rtia ---- */
+		/* ---- 3d: Measure V_Rtia ---- */
 		ret = rtia_cal_adc_mux_cfg(priv,
 			AD5940_ADCMUXP_HSTIA_P, AD5940_ADCMUXN_HSTIA_N);
 		if (ret)
@@ -1830,8 +1941,8 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 
 		ret = rtia_cal_wait_dft_ready(priv, 35000);
 		if (ret) {
-			dev_err(dev, "RTIA cal: V_Rtia DFTRDY timeout at %uHz\n",
-				freq_hz);
+			dev_err(dev, "RTIA cal: V_Rtia DFTRDY timeout at %uHz (band %d)\n",
+				freq_hz, band_id);
 			goto restore_intc;
 		}
 
@@ -1851,15 +1962,7 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 			dft_rtia_imag = (s32)tmp_i;
 		}
 
-		/* Switch ADC MUX back to P_NODE/N_NODE for next iteration */
-		if (i + 1 < cal_count) {
-			ret = rtia_cal_adc_mux_cfg(priv,
-				AD5940_ADCMUXP_P_NODE, AD5940_ADCMUXN_N_NODE);
-			if (ret)
-				goto restore_intc;
-		}
-
-		/* ---- Phase 5: Data post-processing ---- */
+		/* ---- 3e: Data post-processing ---- */
 		if (dft_rcal_real & BIT(17))
 			dft_rcal_real |= 0xFFFC0000;
 		if (dft_rcal_imag & BIT(17))
@@ -1874,100 +1977,67 @@ int ad5940_bia_rtia_cal(struct ad5940_priv *priv)
 		dft_rtia_imag = -dft_rtia_imag;
 		dft_rcal_imag = -dft_rcal_imag;
 
-		/* ---- Phase 6: Compute RTIA = (V_Rtia / V_Rcal) * Rcal ---- */
+		/* ---- 3f: Compute RTIA = (V_Rtia / V_Rcal) * Rcal ---- */
+		denom = (s64)dft_rcal_real * dft_rcal_real +
+			(s64)dft_rcal_imag * dft_rcal_imag;
+		if (denom == 0) {
+			dev_err(dev, "RTIA cal: Rcal DFT denominator is zero at %uHz (band %d)\n",
+				freq_hz, band_id);
+			ret = -EINVAL;
+			goto restore_intc;
+		}
+
+		real_num = (s64)dft_rtia_real * dft_rcal_real +
+			   (s64)dft_rtia_imag * dft_rcal_imag;
+		imag_num = (s64)dft_rtia_imag * dft_rcal_real -
+			   (s64)dft_rtia_real * dft_rcal_imag;
+
+		rtia_real_mohm = div64_s64(real_num * (s64)rcal_ohm * 1000,
+					   denom);
+		rtia_imag_mohm = div64_s64(imag_num * (s64)rcal_ohm * 1000,
+					   denom);
+
+		/* Store in per-band calibration table */
+		priv->band_cal_table[band_id].real_mohm = rtia_real_mohm;
+		priv->band_cal_table[band_id].imag_mohm = rtia_imag_mohm;
+
 		{
-			s64 denom, real_num, imag_num;
-			s64 rtia_real_mohm, rtia_imag_mohm;
+			u64 r2, i2, sum_sq;
 
-			denom = (s64)dft_rcal_real * dft_rcal_real +
-				(s64)dft_rcal_imag * dft_rcal_imag;
-			if (denom == 0) {
-				dev_err(dev, "RTIA cal: Rcal DFT denominator is zero at %uHz\n",
-					freq_hz);
-				ret = -EINVAL;
-				goto restore_intc;
-			}
+			r2 = rtia_real_mohm < 0 ?
+				(u64)(-rtia_real_mohm) * (-rtia_real_mohm) :
+				(u64)rtia_real_mohm * rtia_real_mohm;
+			i2 = rtia_imag_mohm < 0 ?
+				(u64)(-rtia_imag_mohm) * (-rtia_imag_mohm) :
+				(u64)rtia_imag_mohm * rtia_imag_mohm;
+			sum_sq = r2 + i2;
+			priv->band_cal_table[band_id].magnitude_mohm =
+				int_sqrt64(sum_sq);
+		}
 
-			real_num = (s64)dft_rtia_real * dft_rcal_real +
-				   (s64)dft_rtia_imag * dft_rcal_imag;
-			imag_num = (s64)dft_rtia_imag * dft_rcal_real -
-				   (s64)dft_rtia_real * dft_rcal_imag;
+		priv->band_cal_table[band_id].phase_mdeg =
+			rtia_cal_atan2_mdeg(rtia_imag_mohm, rtia_real_mohm);
 
-			rtia_real_mohm = div64_s64(real_num * (s64)rcal_ohm * 1000,
-						   denom);
-			rtia_imag_mohm = div64_s64(imag_num * (s64)rcal_ohm * 1000,
-						   denom);
+		{
+			s64 mag_mohm = priv->band_cal_table[band_id].magnitude_mohm;
+			s32 ph_mdeg = priv->band_cal_table[band_id].phase_mdeg;
+			s64 mag_frac = mag_mohm >= 0 ? mag_mohm % 1000 :
+						  -(mag_mohm % 1000);
 
-			if (priv->sweep_en) {
-				priv->rtia_cal_table[i].real_mohm = rtia_real_mohm;
-				priv->rtia_cal_table[i].imag_mohm = rtia_imag_mohm;
-
-				{
-					u64 r2, i2, sum_sq;
-
-					r2 = rtia_real_mohm < 0 ?
-						(u64)(-rtia_real_mohm) * (-rtia_real_mohm) :
-						(u64)rtia_real_mohm * rtia_real_mohm;
-					i2 = rtia_imag_mohm < 0 ?
-						(u64)(-rtia_imag_mohm) * (-rtia_imag_mohm) :
-						(u64)rtia_imag_mohm * rtia_imag_mohm;
-					sum_sq = r2 + i2;
-					priv->rtia_cal_table[i].magnitude_mohm =
-						int_sqrt64(sum_sq);
-				}
-
-				priv->rtia_cal_table[i].phase_mdeg =
-					rtia_cal_atan2_mdeg(rtia_imag_mohm,
-							    rtia_real_mohm);
-			}
-
-			/* For single-freq or first sweep point, also set active cal */
-			if (!priv->sweep_en || i == 0) {
-				priv->rtia_cal.real_mohm = rtia_real_mohm;
-				priv->rtia_cal.imag_mohm = rtia_imag_mohm;
-
-				{
-					u64 r2, i2, sum_sq;
-
-					r2 = rtia_real_mohm < 0 ?
-						(u64)(-rtia_real_mohm) * (-rtia_real_mohm) :
-						(u64)rtia_real_mohm * rtia_real_mohm;
-					i2 = rtia_imag_mohm < 0 ?
-						(u64)(-rtia_imag_mohm) * (-rtia_imag_mohm) :
-						(u64)rtia_imag_mohm * rtia_imag_mohm;
-					sum_sq = r2 + i2;
-					priv->rtia_cal.magnitude_mohm =
-						int_sqrt64(sum_sq);
-				}
-
-				priv->rtia_cal.phase_mdeg =
-					rtia_cal_atan2_mdeg(rtia_imag_mohm,
-							    rtia_real_mohm);
-			}
-
-			{
-				s64 mag_mohm = priv->sweep_en ?
-					priv->rtia_cal_table[i].magnitude_mohm :
-					priv->rtia_cal.magnitude_mohm;
-				s32 ph_mdeg = priv->sweep_en ?
-					priv->rtia_cal_table[i].phase_mdeg :
-					priv->rtia_cal.phase_mdeg;
-				dev_info(dev,
-					 "RTIA cal[%d] @%uHz: Mag=%lld.%03lld Ohm, Phase=%d.%03d deg\n",
-					 i, freq_hz,
-					 div_s64(mag_mohm, 1000),
-					 mag_mohm >= 0 ? mag_mohm % 1000 : -(mag_mohm % 1000),
-					 ph_mdeg / 1000,
-					 ph_mdeg >= 0 ? ph_mdeg % 1000 : -(ph_mdeg % 1000));
-			}
+			dev_info(dev,
+				 "RTIA cal band %d @%uHz: Mag=%lld.%03lld Ohm, Phase=%d.%03d deg\n",
+				 band_id, freq_hz,
+				 div_s64(mag_mohm, 1000), mag_frac,
+				 ph_mdeg / 1000,
+				 ph_mdeg >= 0 ? ph_mdeg % 1000 :
+						-(ph_mdeg % 1000));
 		}
 	}
 
-	/* After sweep calibration, reset index to start */
-	if (priv->sweep_en) {
+	/* ---- Phase 4: Set initial active calibration ---- */
+	priv->rtia_cal = priv->band_cal_table[first_active_band];
+	if (priv->sweep_en)
 		priv->sweep_index = 0;
-		priv->rtia_cal = priv->rtia_cal_table[0];
-	}
 
 restore_intc:
 	/* Restore INTC1 DFTRDY configuration */

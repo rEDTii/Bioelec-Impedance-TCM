@@ -318,8 +318,25 @@
 #define AD5940_SWT_RCAL1		BIT(11)	/* 0x800 */
 #define AD5940_SWT_TRTIA		BIT(8)	/* 0x100 */
 
-/* HSTIARTIA enum values */
+/* HSTIARTIA enum values - RtiaSel field in HSRTIACON */
+#define AD5940_HSTIARTIA_200		0
 #define AD5940_HSTIARTIA_1K		1
+#define AD5940_HSTIARTIA_5K		2
+#define AD5940_HSTIARTIA_10K		3
+#define AD5940_HSTIARTIA_20K		4
+#define AD5940_HSTIARTIA_40K		5
+#define AD5940_HSTIARTIA_80K		6
+#define AD5940_HSTIARTIA_160K		7
+
+/* RTIA resistance values indexed by HSTIARTIA_xxx enum (milliohms) */
+#define AD5940_HSTIARTIA_200_MOHM	200000ULL
+#define AD5940_HSTIARTIA_1K_MOHM	1000000ULL
+#define AD5940_HSTIARTIA_5K_MOHM	5000000ULL
+#define AD5940_HSTIARTIA_10K_MOHM	10000000ULL
+#define AD5940_HSTIARTIA_20K_MOHM	20000000ULL
+#define AD5940_HSTIARTIA_40K_MOHM	40000000ULL
+#define AD5940_HSTIARTIA_80K_MOHM	80000000ULL
+#define AD5940_HSTIARTIA_160K_MOHM	160000000ULL
 
 /* HSTIADERLOAD enum values */
 #define AD5940_HSTIADERLOAD_OPEN	5
@@ -423,6 +440,54 @@
 #define AD5940_CHIPID_VALUE	0x5502
 
 /* ================================================================== */
+/*  BIA RTIA Hardware Configuration                                    */
+/*  Modify these to match your PCB and RTIA selection.                 */
+/* ================================================================== */
+
+/*
+ * HSTIA RTIA feedback resistor selection.
+ * Must be one of: AD5940_HSTIARTIA_200, _1K, _5K, _10K, _20K, _40K, _80K, _160K
+ * Default: 5K (matches ADI evaluation boards)
+ */
+#define AD5940_BIA_RTIA_SEL		AD5940_HSTIARTIA_1K
+
+/*
+ * CTIA (compensation capacitor) selection for HSTIA.
+ * Range: 0..31. Larger values provide better stability for larger RTIA.
+ * Default: 31 (recommended for 5K and above)
+ */
+#define AD5940_BIA_RTIA_CTIA		31
+
+/*
+ * RCAL resistor value on the PCB, in ohms.
+ * Standard: 10k (matches ADI evaluation boards)
+ */
+#define AD5940_BIA_RCAL_OHM		10000
+
+/*
+ * Derived: nominal RTIA resistance in ohms (auto-computed from RTIA_SEL).
+ */
+#if AD5940_BIA_RTIA_SEL == AD5940_HSTIARTIA_200
+#define AD5940_BIA_RTIA_OHM		200
+#elif AD5940_BIA_RTIA_SEL == AD5940_HSTIARTIA_1K
+#define AD5940_BIA_RTIA_OHM		1000
+#elif AD5940_BIA_RTIA_SEL == AD5940_HSTIARTIA_5K
+#define AD5940_BIA_RTIA_OHM		5000
+#elif AD5940_BIA_RTIA_SEL == AD5940_HSTIARTIA_10K
+#define AD5940_BIA_RTIA_OHM		10000
+#elif AD5940_BIA_RTIA_SEL == AD5940_HSTIARTIA_20K
+#define AD5940_BIA_RTIA_OHM		20000
+#elif AD5940_BIA_RTIA_SEL == AD5940_HSTIARTIA_40K
+#define AD5940_BIA_RTIA_OHM		40000
+#elif AD5940_BIA_RTIA_SEL == AD5940_HSTIARTIA_80K
+#define AD5940_BIA_RTIA_OHM		80000
+#elif AD5940_BIA_RTIA_SEL == AD5940_HSTIARTIA_160K
+#define AD5940_BIA_RTIA_OHM		160000
+#else
+#error "AD5940_BIA_RTIA_SEL must be one of AD5940_HSTIARTIA_*"
+#endif
+
+/* ================================================================== */
 /*  Timing / FIFO / channel constants                                 */
 /* ================================================================== */
 
@@ -433,6 +498,7 @@
 #define AD5940_FIFO_WORDS_PER_FRAME	4	/* FIFO words per DFT measurement cycle */
 #define AD5940_DFT_CHANNELS		7	/* IIO scan channels: 4 DFT + 1 freq + 2 RTIA */
 #define AD5940_MAX_SWEEP_POINTS		100
+#define AD5940_MAX_FREQ_BANDS		3	/* Band0: ≤100Hz, Band1: ≤2kHz, Band2: >2kHz */
 
 /*
  * READFIFO burst read limit.
@@ -498,8 +564,8 @@ static const struct {
  * Default parameters (from AppBIACfg default values):
  *   SysClkFreq = 16MHz, SinFreq = 50kHz, DacVoltPP = 800mV
  *   ExcitBufGain = EXCITBUFGAIN_2, HsDacGain = HSDACGAIN_1
- *   HsDacUpdateRate = 7, HstiaRtiaSel = HSTIARTIA_1K (=1)
- *   CtiaSel = 16, ADCPgaGain = ADCPGA_1P5 (=1)
+ *   HsDacUpdateRate = 7, HstiaRtiaSel = AD5940_BIA_RTIA_SEL
+ *   CtiaSel = AD5940_BIA_RTIA_CTIA, ADCPgaGain = ADCPGA_1P5 (=1)
  *   ADCSinc3Osr = ADCSINC3OSR_2 (=2), ADCSinc2Osr = ADCSINC2OSR_22 (=0)
  *   DftNum = DFTNUM_8192 (=11), DftSrc = DFTSRC_SINC3 (=1), HanWinEn = true
  *   PwrMod = AFEPWR_LP (=0), AFEBW = 250kHz (=3)
@@ -672,7 +738,9 @@ enum ad5940_sweep_type {
  * @sweep_next_freq_hz:  frequency for next WUPT cycle
  * @freq_of_data_hz:     frequency of the most recent FIFO data
  * @curr_freq_params:    current DSP parameters for the active frequency band
- * @rtia_cal_table:  per-frequency RTIA calibration results
+ * @band_cal_table:  per-band RTIA calibration results
+ * @sweep_band_map:  maps sweep index to band ID (0..AD5940_MAX_FREQ_BANDS-1)
+ * @num_active_bands: number of bands that have sweep points and are calibrated
  */
 struct ad5940_priv {
 	struct spi_device		*spi;
@@ -713,7 +781,9 @@ struct ad5940_priv {
 	struct seq_shadow_regs		meas_shadow;	/* shadow regs for measure seq regeneration */
 	u32				meas_seq_addr;	/* SRAM start address of measure sequence */
 	int				meas_seq_len;	/* command count of measure sequence */
-	struct ad5940_rtia_cal_result rtia_cal_table[AD5940_MAX_SWEEP_POINTS];
+	struct ad5940_rtia_cal_result	band_cal_table[AD5940_MAX_FREQ_BANDS];
+	u8				sweep_band_map[AD5940_MAX_SWEEP_POINTS];
+	int				num_active_bands;
 };
 
 /* ---- Core register access API ---- */
