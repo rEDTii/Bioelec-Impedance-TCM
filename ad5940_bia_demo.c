@@ -1,7 +1,23 @@
 /*
- * AD5940 BIA User-Space Demo — Read DFT data via IIO and compute impedance
+ * AD5940 BIA User-Space Demo — Daemon mode with command socket
  *
  * Built against libiio v1.0 API (stream model).
+ *
+ * Architecture:
+ *   ┌──────────┐   cmd DGRAM   ┌────────────────────┐   data DGRAM   ┌─────────┐
+ *   │  Qt GUI  │ ◄────────────►│  ad5940_bia_demo    │◄───────────────│ AD5940  │
+ *   │          │  S/T/?/Q      │  (this program)     │  IIO stream    │ driver  │
+ *   └──────────┘               └────────────────────┘                 └─────────┘
+ *
+ * Commands (single-byte datagrams on /tmp/bia_cmd.sock):
+ *   'S' — START acquisition (enable IIO buffer, begin streaming)
+ *   'T' — STOP  acquisition (disable IIO buffer)
+ *   '?' — STATUS query (reply: sweep_points as uint32 LE)
+ *   'Q' — QUIT daemon (cleanup and exit)
+ *
+ * Data output (DGRAM on /tmp/bia_sample.sock):
+ *   Before first sample after START: bia_meta_t (sweep_points)
+ *   Each measurement cycle:         bia_sample_t (impedance data)
  *
  * Cross-compile for RK3568 (aarch64):
  *   TOOLCHAIN=path/to/aarch64-linux-gnu
@@ -12,26 +28,7 @@
  *       -liio -lm -lpthread -lrt -static
  *
  * Usage:
- *   ./ad5940_bia_demo                    # default: 100 samples
- *   ./ad5940_bia_demo 0                  # run forever until Ctrl-C
- *   ./ad5940_bia_demo 500                # collect 500 samples
- *
- * Prerequisites:
- *   - ad5940 kernel module loaded
- *   - IIO buffer enabled (or use AFE_enable.sh)
- *
- * Data flow:
- *   AD5940 FIFO (4 words per measurement cycle) + 1 frequency word:
- *     word0 = Current DFT Real   (18-bit signed, bits[17:0])
- *     word1 = Current DFT Imag
- *     word2 = Voltage DFT Real
- *     word3 = Voltage DFT Imag
- *     word4 = Excitation Frequency (32-bit unsigned, in Hz)
- *
- *   Impedance calculation (from ADI BodyImpedance.c AppBIAISR()):
- *     |Z| = |V| / |I| * Rtia
- *     angle(Z) = angle(V) - angle(I)
- *   where Rtia is the HSTIA feedback resistor (configured via AD5940_BIA_RTIA_SEL).
+ *   ./ad5940_bia_demo     # daemon mode: listen on cmd sock, wait for START
  */
 
 #include <stdio.h>
@@ -45,41 +42,63 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/select.h>
 #include <iio.h>
 
 /* ------------------------------------------------------------------ */
-/*  BIA parameters — must match kernel driver configuration           */
+/*  Constants                                                         */
 /* ------------------------------------------------------------------ */
-
-/*
- * Rtia: HSTIA feedback resistor nominal value in Ohms.
- * Must match AD5940_BIA_RTIA_SEL / AD5940_BIA_RTIA_OHM in kernel driver.
- *
- * Note: ADI's AppBIAISR() uses RtiaCurrValue[] from AD5940_HSRtiaCal()
- * which returns the calibrated Rtia (magnitude + phase). For this demo
- * we use the nominal value. For precision measurements, you should
- * run the Rtia calibration procedure and substitute the calibrated value.
- * The actual calibrated values are read from the driver via IIO channels.
- */
-// #define RTIA_NOMINAL_OHM	5000.0f	/* matches AD5940_BIA_RTIA_SEL = HSTIARTIA_5K */
 
 /* Each measurement cycle produces 4 FIFO words + 1 frequency + 2 RTIA */
 #define NUM_DFT_CHANNELS	4
 #define NUM_CHANNELS		7
 
+/* Socket paths */
+#define BIA_DATA_SOCK_PATH	"/tmp/bia_sample.sock"
+#define BIA_CMD_SOCK_PATH	"/tmp/bia_cmd.sock"
+
+/* Command bytes (single-char datagrams) */
+#define CMD_START		'S'
+#define CMD_STOP		'T'
+#define CMD_STATUS		'?'
+#define CMD_QUIT		'Q'
+
+/* Magic number for meta-info packet (distinguishes from bia_sample_t) */
+#define BIA_META_MAGIC		0xB1A00000u
+
+/* Module parameter sysfs path for sweep_points */
+#define SYSFS_SWEEP_POINTS	"/sys/module/ad5940/parameters/sweep_points"
+
+/* ------------------------------------------------------------------ */
+/*  Protocol structures                                                */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+	float magnitude;		/* |Z| in Ohms */
+	float phase;			/* angle(Z) in degrees */
+	float resistance;		/* Real part R in Ohms */
+	float reactance;		/* Imaginary part X in Ohms */
+	uint32_t freq_hz;		/* Excitation frequency in Hz */
+	int32_t curr_real;		/* Raw DFT: current real (18-bit signed) */
+	int32_t curr_imag;		/* Raw DFT: current imag */
+	int32_t volt_real;		/* Raw DFT: voltage real */
+	int32_t volt_imag;		/* Raw DFT: voltage imag */
+} bia_sample_t;
+
+/*
+ * Meta-info packet sent before first data sample after each START.
+ * Sent over the same data socket; distinguished by magic != valid freq.
+ */
+typedef struct {
+	uint32_t magic;			/* = BIA_META_MAGIC */
+	uint32_t sweep_points;		/* Number of frequency points */
+	uint32_t sweep_type;		/* 0=linear, 1=log, 2=custom */
+} bia_meta_t;
+
 /* ------------------------------------------------------------------ */
 /*  DFT data parsing helpers                                          */
 /* ------------------------------------------------------------------ */
 
-/*
- * sign_extend_18bit — Convert 18-bit two's complement to int32_t
- *
- * AD5940 DFT results are 18-bit signed values in bits[17:0] of a
- * 32-bit FIFO word. Bit17 is the sign bit.
- * This matches ADI's AppBIAISR() logic:
- *   pData[i] &= 0x3ffff;
- *   if(pData[i]&(1<<17)) pData[i] |= 0xfffc0000;
- */
 static inline int32_t sign_extend_18bit(uint32_t raw)
 {
 	raw &= 0x3FFFF;
@@ -89,55 +108,22 @@ static inline int32_t sign_extend_18bit(uint32_t raw)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Impedance calculation (mirrors ADI AppBIAISR)                     */
+/*  Impedance calculation                                             */
 /* ------------------------------------------------------------------ */
 
-typedef struct {
-	float magnitude;	/* |Z| in Ohms */
-	float phase;		/* angle(Z) in degrees */
-	float resistance;	/* Real part R in Ohms */
-	float reactance;	/* Imaginary part X in Ohms */
-	uint32_t freq_hz;	/* Excitation frequency in Hz */
-	int32_t curr_real;	/* Raw DFT: current channel real part (18-bit signed) */
-	int32_t curr_imag;	/* Raw DFT: current channel imaginary part */
-	int32_t volt_real;	/* Raw DFT: voltage channel real part */
-	int32_t volt_imag;	/* Raw DFT: voltage channel imaginary part */
-} bia_sample_t;
-
-/*
- * compute_impedance — Calculate impedance from DFT voltage and current
- *
- * Formula (from ADI BodyImpedance.c):
- *   VoltMag   = sqrt(Vr^2 + Vi^2)
- *   VoltPhase = atan2(-Vi, Vr)      // Note: ADI negates imaginary
- *   CurrMag   = sqrt(Ir^2 + Ii^2)
- *   CurrPhase = atan2(-Ii, Ir)
- *   |Z|       = VoltMag / CurrMag * RtiaCal.magnitude
- *   angle(Z)  = VoltPhase - CurrPhase + RtiaCal.phase
- *
- * Rtia magnitude is in milliohms, phase in millidegrees (from driver).
- */
-static void compute_impedance(int32_t curr_real, int32_t curr_imag,
-			      int32_t volt_real, int32_t volt_imag,
+static void compute_impedance(int32_t cr, int32_t ci,
+			      int32_t vr, int32_t vi,
 			      float rtia_mag_ohm, float rtia_phase_deg,
-			      uint32_t freq_hz,
-			      bia_sample_t *result)
+			      uint32_t freq_hz, bia_sample_t *out)
 {
-	float vr = (float)volt_real;
-	float vi = (float)volt_imag;
-	float ir = (float)curr_real;
-	float ii = (float)curr_imag;
-
-	float volt_mag   = sqrtf(vr * vr + vi * vi);
-	float volt_phase = atan2f(-vi, vr);	/* ADI convention */
-	float curr_mag   = sqrtf(ir * ir + ii * ii);
-	float curr_phase = atan2f(-ii, ir);
+	float volt_mag   = sqrtf((float)vr * vr + (float)vi * vi);
+	float volt_phase = atan2f(-vi, vr);
+	float curr_mag   = sqrtf((float)cr * cr + (float)ci * ci);
+	float curr_phase = atan2f(-ci, cr);
 
 	if (curr_mag < 1e-6f) {
-		result->magnitude  = 0.0f;
-		result->phase      = 0.0f;
-		result->resistance = 0.0f;
-		result->reactance  = 0.0f;
+		memset(out, 0, sizeof(*out));
+		out->freq_hz = freq_hz;
 		return;
 	}
 
@@ -145,387 +131,581 @@ static void compute_impedance(int32_t curr_real, int32_t curr_imag,
 	float z_phase = volt_phase - curr_phase
 		      + rtia_phase_deg * (float)M_PI / 180.0f;
 
-	/* Normalize phase to (-π, π] to avoid wrap-around artifacts
-	 * (e.g. 358° instead of -2°). atan2 subtraction can produce
-	 * results outside (-π, π] when the two angles are on opposite
-	 * sides of the ±π boundary.  BIA impedance phase is physically
-	 * bounded to (-90°, 90°), so the normalized value is always correct.
-	 */
 	z_phase = atan2f(sinf(z_phase), cosf(z_phase));
 
-	float z_phase_deg = z_phase * 180.0f / (float)M_PI;
-
-	result->magnitude  = z_mag;
-	result->phase      = z_phase_deg;
-	result->resistance = z_mag * cosf(z_phase);
-	result->reactance  = z_mag * sinf(z_phase);
-	result->freq_hz    = freq_hz;
-	result->curr_real  = curr_real;
-	result->curr_imag  = curr_imag;
-	result->volt_real  = volt_real;
-	result->volt_imag  = volt_imag;
+	out->magnitude   = z_mag;
+	out->phase       = z_phase * 180.0f / (float)M_PI;
+	out->resistance  = z_mag * cosf(z_phase);
+	out->reactance   = z_mag * sinf(z_phase);
+	out->freq_hz     = freq_hz;
+	out->curr_real   = cr;
+	out->curr_imag   = ci;
+	out->volt_real   = vr;
+	out->volt_imag   = vi;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Signal handling                                                   */
+/*  Global state (shared between threads)                              */
 /* ------------------------------------------------------------------ */
 
-static volatile sig_atomic_t keep_running = 1;
+static volatile sig_atomic_t g_keep_running = 1;
+static volatile int g_acquiring = 0;		/* 1 while actively acquiring */
+static volatile int g_sweep_points = 0;	/* read from sysfs at START */
+static volatile int g_sweep_type = 0;		/* read from sysfs at START */
+
+static pthread_mutex_t g_state_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_acquire_cond = PTHREAD_COND_INITIALIZER;
 
 static void sigint_handler(int sig)
 {
 	(void)sig;
-	keep_running = 0;
+	g_keep_running = 0;
+	pthread_cond_signal(&g_acquire_cond);
 }
 
 /* ------------------------------------------------------------------ */
-/*  Ring buffer + communication thread                                */
+/*  Sysfs helpers                                                      */
 /* ------------------------------------------------------------------ */
 
-#define RING_BUF_SIZE		16	/* power of 2 for fast modulo */
+static int read_sysfs_int(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (!f) return -1;
+	int val;
+	if (fscanf(f, "%d", &val) != 1)
+		val = -1;
+	fclose(f);
+	return val;
+}
 
-/* Unix DGRAM socket path — must match dummy_Qt */
-#define BIA_SOCK_PATH		"/tmp/bia_sample.sock"
+static void read_sweep_params(void)
+{
+	g_sweep_points = read_sysfs_int(SYSFS_SWEEP_POINTS);
+	if (g_sweep_points <= 0)
+		g_sweep_points = 12;	/* fallback default (custom table size) */
+
+	/* Also try sweep_type */
+	int st = read_sysfs_int("/sys/module/ad5940/parameters/sweep_type");
+	g_sweep_type = (st >= 0 && st <= 2) ? st : 0;
+
+	printf("[demo] sweep_points=%d, sweep_type=%d\n",
+	       g_sweep_points, g_sweep_type);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Ring buffer for data → communication thread                       */
+/* ------------------------------------------------------------------ */
+
+#define RING_SIZE	16
 
 typedef struct {
-	bia_sample_t	buf[RING_BUF_SIZE];
-	int		head;		/* next write position */
-	int		tail;		/* next read position */
-	int		count;		/* number of occupied slots */
-	pthread_mutex_t	mutex;
+	bia_sample_t	buf[RING_SIZE];
+	int		head, tail, count;
+	pthread_mutex_t	mtx;
 	pthread_cond_t	cond;
-} ring_buffer_t;
+} ringbuf_t;
 
-static ring_buffer_t g_ring = {
-	.mutex  = PTHREAD_MUTEX_INITIALIZER,
-	.cond   = PTHREAD_COND_INITIALIZER,
+static ringbuf_t g_ring = {
+	.mtx = PTHREAD_MUTEX_INITIALIZER,
+	.cond = PTHREAD_COND_INITIALIZER,
 };
 
-static void ring_push(ring_buffer_t *rb, const bia_sample_t *sample)
+static void ring_push(ringbuf_t *r, const bia_sample_t *s)
 {
-	pthread_mutex_lock(&rb->mutex);
-
-	/* Overwrite oldest if full (consumer too slow) */
-	if (rb->count == RING_BUF_SIZE) {
-		rb->tail = (rb->tail + 1) % RING_BUF_SIZE;
-		rb->count--;
+	pthread_mutex_lock(&r->mtx);
+	if (r->count == RING_SIZE) {
+		r->tail = (r->tail + 1) % RING_SIZE;
+		r->count--;
 	}
-
-	rb->buf[rb->head] = *sample;
-	rb->head = (rb->head + 1) % RING_BUF_SIZE;
-	rb->count++;
-
-	pthread_cond_signal(&rb->cond);
-	pthread_mutex_unlock(&rb->mutex);
+	r->buf[r->head] = *s;
+	r->head = (r->head + 1) % RING_SIZE;
+	r->count++;
+	pthread_cond_signal(&r->cond);
+	pthread_mutex_unlock(&r->mtx);
 }
 
-static int ring_pop(ring_buffer_t *rb, bia_sample_t *sample)
+static int ring_pop(ringbuf_t *r, bia_sample_t *s)
 {
-	pthread_mutex_lock(&rb->mutex);
-
-	while (rb->count == 0 && keep_running)
-		pthread_cond_wait(&rb->cond, &rb->mutex);
-
-	if (rb->count == 0) {
-		pthread_mutex_unlock(&rb->mutex);
-		return -1;	/* shutdown, no data */
+	pthread_mutex_lock(&r->mtx);
+	while (r->count == 0 && g_keep_running)
+		pthread_cond_wait(&r->cond, &r->mtx);
+	if (r->count == 0) {
+		pthread_mutex_unlock(&r->mtx);
+		return -1;
 	}
-
-	*sample = rb->buf[rb->tail];
-	rb->tail = (rb->tail + 1) % RING_BUF_SIZE;
-	rb->count--;
-
-	pthread_mutex_unlock(&rb->mutex);
+	*s = r->buf[r->tail];
+	r->tail = (r->tail + 1) % RING_SIZE;
+	r->count--;
+	pthread_mutex_unlock(&r->mtx);
 	return 0;
 }
 
-/*
- * comm_thread_fn — Communication thread: pops samples and sends them
- * over a Unix DGRAM socket to the Qt process (or dummy_Qt).
- */
+/* ------------------------------------------------------------------ */
+/*  Communication thread: sends samples/meta over data socket          */
+/* ------------------------------------------------------------------ */
+
 static void *comm_thread_fn(void *arg)
 {
-	bia_sample_t sample;
-	int seq = 0;
-	int fd = -1;
-	struct sockaddr_un addr;
-
 	(void)arg;
+	int fd;
+	struct sockaddr_un addr;
+	int seq = 0;
+	bool meta_sent = false;
 
-	/* Create Unix DGRAM socket */
 	fd = socket(AF_UNIX, SOCK_DGRAM, 0);
 	if (fd < 0) {
-		fprintf(stderr, "[comm] ERROR: socket(): %s\n", strerror(errno));
+		fprintf(stderr, "[comm] socket(): %s\n", strerror(errno));
 		return NULL;
 	}
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, BIA_SOCK_PATH, sizeof(addr.sun_path) - 1);
+	strncpy(addr.sun_path, BIA_DATA_SOCK_PATH, sizeof(addr.sun_path) - 1);
 
-	printf("[comm] Communication thread started (sending to %s)\n",
-	       BIA_SOCK_PATH);
+	printf("[comm] Sending data to %s\n", BIA_DATA_SOCK_PATH);
 
-	while (keep_running) {
+	while (g_keep_running) {
+		/* Try to pop a regular sample */
+		bia_sample_t sample;
 		if (ring_pop(&g_ring, &sample) < 0)
 			break;
 
-		seq++;
+		/*
+		 * Send meta-info packet before the first sample of each round.
+		 * This tells the Qt frontend how many sweep_points to expect,
+		 * so it can auto-stop after one complete sweep and show progress.
+		 */
+		if (!meta_sent && g_acquiring) {
+			bia_meta_t meta = {
+				.magic = BIA_META_MAGIC,
+				.sweep_points = (uint32_t)g_sweep_points,
+				.sweep_type = (uint32_t)g_sweep_type,
+			};
+			ssize_t mn = sendto(fd, &meta, sizeof(meta), 0,
+					    (struct sockaddr *)&addr,
+					    sizeof(addr));
+			if ((size_t)mn == sizeof(meta))
+				printf("[comm] META sent: %u points, type %u\n",
+				       meta.sweep_points, meta.sweep_type);
+			else
+				fprintf(stderr, "[comm] META send failed: %zd\n",
+					mn);
+			meta_sent = true;
+		}
 
-		/* Send raw bia_sample_t as one datagram */
+		/* Reset meta_sent when acquisition stops */
+		if (!g_acquiring)
+			meta_sent = false;
+
+		seq++;
 		ssize_t n = sendto(fd, &sample, sizeof(sample), 0,
 				   (struct sockaddr *)&addr, sizeof(addr));
-		if (n < 0) {
-			fprintf(stderr, "[comm] sendto failed (#%d): %s\n",
-				seq, strerror(errno));
-		} else if (n != sizeof(sample)) {
+		if ((size_t)n != sizeof(sample))
 			fprintf(stderr, "[comm] sendto partial: %zd/%zu\n",
 				n, sizeof(sample));
-		}
 	}
 
-	if (fd >= 0)
-		close(fd);
-	printf("[comm] Communication thread exiting (%d samples sent)\n", seq);
+	close(fd);
+	printf("[comm] Exiting (%d datagrams sent)\n", seq);
 	return NULL;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Main program                                                      */
+/*  Acquisition thread: reads IIO stream, computes impedance            */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+	struct iio_context	*ctx;
+	struct iio_device	*dev;
+	struct iio_channel	*ch[NUM_CHANNELS];
+	struct iio_buffer	*buf;
+	struct iio_channels_mask *mask;
+	struct iio_stream	*stream;
+} iio_state_t;
+
+/*
+ * enable_buffer — Enable/disable the IIO triggered buffer.
+ * Returns 0 on success.
+ */
+static int enable_iio_buffer(struct iio_device *dev, bool en)
+{
+	const char *val = en ? "1" : "0";
+	char path[256];
+
+	snprintf(path, sizeof(path),
+		 "/sys/bus/iio/devices/%s/buffer/enable",
+		 iio_device_get_id(dev));
+	FILE *f = fopen(path, "w");
+	if (!f) {
+		fprintf(stderr, "[demo] Cannot open %s: %s\n",
+			path, strerror(errno));
+		return -1;
+	}
+	int ok = (fwrite(val, 1, 1, f) == 1);
+	fclose(f);
+
+	printf("[demo] IIO buffer %s (%s)\n",
+	       en ? "ENABLED" : "DISABLED", path);
+	return ok ? 0 : -1;
+}
+
+static void *acq_thread_fn(void *arg)
+{
+	iio_state_t *s = (iio_state_t *)arg;
+	int sample_count = 0;
+
+	while (g_keep_running) {
+		/* Wait for START command */
+		pthread_mutex_lock(&g_state_mtx);
+		while (!g_acquiring && g_keep_running)
+			pthread_cond_wait(&g_acquire_cond, &g_state_mtx);
+		if (!g_keep_running) {
+			pthread_mutex_unlock(&g_state_mtx);
+			break;
+		}
+		pthread_mutex_unlock(&g_state_mtx);
+
+		/*
+		 * ---- Create a fresh stream for this acquisition round ----
+		 *
+		 * iio_stream_cancel() permanently invalidates a stream object;
+		 * there is no "uncancel" API. So we must destroy and recreate
+		 * the stream for each round. This also ensures the buffer
+		 * enable/disable lifecycle is clean.
+		 */
+		s->stream = iio_buffer_create_stream(s->buf, 4, 1, s->mask);
+		if (iio_err(s->stream)) {
+			fprintf(stderr, "[demo] Cannot create stream: %s\n",
+				strerror(-iio_err(s->stream)));
+			pthread_mutex_lock(&g_state_mtx);
+			g_acquiring = 0;
+			pthread_mutex_unlock(&g_state_mtx);
+			continue;
+		}
+
+		sample_count = 0;
+
+		/*
+		 * ---- Acquisition loop ----
+		 *
+		 * iio_stream_get_next_block() internally handles buffer/enable
+		 * on the first call. We do NOT manually write sysfs enable=1.
+		 *
+		 * Stop conditions:
+		 *   a) User presses STOP → main thread calls
+		 *      iio_stream_cancel() + sets g_acquiring=0
+		 *   b) Auto-stop: sample_count >= g_sweep_points
+		 *      (prevents driver sweep wrap-around from producing
+		 *      an extra sample before Qt's STOP arrives)
+		 */
+		while (g_keep_running && g_acquiring) {
+			const struct iio_block *block;
+
+			block = iio_stream_get_next_block(s->stream);
+			if (!block || iio_err(block)) {
+				if (!g_keep_running || !g_acquiring)
+					break;	/* Expected: STOP cancelled */
+				fprintf(stderr, "[demo] Stream error: %s\n",
+					iio_err(block) ?
+					strerror(-iio_err(block)) : "null");
+				break;
+			}
+
+			/* Extract channel data from this block */
+			int32_t raw[NUM_CHANNELS];
+			int64_t raw_rtia_mag;
+			int32_t raw_rtia_phase;
+			unsigned int i;
+
+			for (i = 0; i < NUM_CHANNELS - 2; i++) {
+				size_t nr = iio_channel_read(s->ch[i], block,
+							     &raw[i],
+							     sizeof(int32_t),
+							     true);
+				if (nr < sizeof(int32_t))
+					goto acq_err;
+			}
+			/* RTIA channels: resistance0=int64, phase0=int32 */
+			iio_channel_read(s->ch[5], block,
+					 &raw_rtia_mag, sizeof(int64_t), true);
+			iio_channel_read(s->ch[6], block,
+					 &raw_rtia_phase, sizeof(int32_t),
+					 true);
+
+			int32_t cr = sign_extend_18bit((uint32_t)raw[0]);
+			int32_t ci = sign_extend_18bit((uint32_t)raw[1]);
+			int32_t vr = sign_extend_18bit((uint32_t)raw[2]);
+			int32_t vi = sign_extend_18bit((uint32_t)raw[3]);
+
+			float rtm = (float)raw_rtia_mag / 1000.0f;
+			float rtp = (float)raw_rtia_phase / 1000.0f;
+			uint32_t freq = (uint32_t)raw[4];
+
+			bia_sample_t sample;
+			compute_impedance(cr, ci, vr, vi, rtm, rtp, freq, &sample);
+
+			ring_push(&g_ring, &sample);
+			sample_count++;
+
+			/*
+			 * ---- Auto-stop: one sweep round complete ----
+			 * The driver's sweep_index wraps around to 0 after
+			 * sweep_points. Without this check, we'd keep reading
+			 * the first frequency point again before Qt's STOP
+			 * command arrives through the socket.
+			 */
+			if (g_sweep_points > 0 &&
+			    sample_count >= g_sweep_points) {
+				printf("[demo] Sweep complete: %d/%d samples\n",
+				       sample_count, g_sweep_points);
+				break;
+			}
+		}
+
+	acq_err:
+		/* ---- Teardown this round ---- */
+		/* Cancel any pending block read, then destroy stream */
+		iio_stream_cancel(s->stream);
+		iio_stream_destroy(s->stream);
+		s->stream = NULL;
+
+		/* Stop the hardware via sysfs (tells driver to stop WUPT) */
+		enable_iio_buffer(s->dev, false);
+
+		pthread_mutex_lock(&g_state_mtx);
+		g_acquiring = 0;
+		pthread_mutex_unlock(&g_state_mtx);
+
+		printf("[demo] Acquisition stopped, %d samples\n", sample_count);
+
+		/* Small delay before re-entering wait state */
+		usleep(100000);
+	}
+
+	return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main: command listener loop                                       */
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[])
 {
-	struct iio_context *ctx = NULL;
-	struct iio_device  *dev = NULL;
-	struct iio_channel *ch[NUM_CHANNELS] = {NULL};
-	struct iio_buffer  *buf = NULL;
-	struct iio_channels_mask *mask = NULL;
-	struct iio_stream  *stream = NULL;
-
-	int max_samples = 0;	/* 0 = run forever until signal */
-	int sample_count = 0;
+	iio_state_t s = {0};
 	int ret = 0;
-	bool comm_started = false;
-	pthread_t comm_thread;
+	int cmd_fd = -1;
+	pthread_t acq_tid, comm_tid;
 
-	if (argc > 1) {
-		max_samples = atoi(argv[1]);
-		if (max_samples < 0)
-			max_samples = 0;	/* 0 = run forever */
-	}
+	(void)argc;
+	(void)argv;
 
 	signal(SIGINT, sigint_handler);
 	signal(SIGTERM, sigint_handler);
 
-	/* ---- Create IIO context (local) ---- */
-	ctx = iio_create_context(NULL, "local:");
-	if (iio_err(ctx)) {
-		fprintf(stderr, "ERROR: Cannot create local IIO context: %s\n",
-			strerror(-iio_err(ctx)));
+	/* ---- Create IIO context (local, persistent) ---- */
+	s.ctx = iio_create_context(NULL, "local:");
+	if (iio_err(s.ctx)) {
+		fprintf(stderr, "ERROR: Cannot create IIO context: %s\n",
+			strerror(-iio_err(s.ctx)));
 		return 1;
 	}
-
-	/*
-	 * Set timeout: Plan C parameters make each measurement cycle
-	 * ~27 seconds. Use 0 for no timeout (wait indefinitely).
-	 */
-	iio_context_set_timeout(ctx, 0);
+	iio_context_set_timeout(s.ctx, 0);	/* blocking, no timeout */
 
 	/* ---- Find AD5940 device ---- */
-	dev = iio_context_find_device(ctx, "ad5940");
-	if (!dev) {
-		fprintf(stderr, "ERROR: Cannot find IIO device 'ad5940'. "
-			"Is the kernel module loaded?\n");
+	s.dev = iio_context_find_device(s.ctx, "ad5940");
+	if (!s.dev) {
+		fprintf(stderr, "ERROR: Device 'ad5940' not found. "
+			"Is module loaded?\n");
 		ret = 1;
 		goto cleanup;
 	}
 
-	printf("AD5940 BIA Impedance Demo (libiio v%u.%u)\n",
-	       iio_context_get_version_major(ctx),
-	       iio_context_get_version_minor(ctx));
-	printf("Device: %s, Channels: %u\n",
-	       iio_device_get_name(dev) ? iio_device_get_name(dev) : "ad5940",
-	       iio_device_get_channels_count(dev));
+	printf("AD5940 BIA Daemon v2 (libiio v%u.%u)\n",
+	       iio_context_get_version_major(s.ctx),
+	       iio_context_get_version_minor(s.ctx));
 
 	/* ---- Get channels ---- */
-	ch[0] = iio_device_find_channel(dev, "current0", false);
-	ch[1] = iio_device_find_channel(dev, "current1", false);
-	ch[2] = iio_device_find_channel(dev, "voltage0", false);
-	ch[3] = iio_device_find_channel(dev, "voltage1", false);
-	ch[4] = iio_device_find_channel(dev, "altvoltage0", false);
-	ch[5] = iio_device_find_channel(dev, "resistance0", false);
-	ch[6] = iio_device_find_channel(dev, "phase0", false);
-
+	s.ch[0] = iio_device_find_channel(s.dev, "current0", false);
+	s.ch[1] = iio_device_find_channel(s.dev, "current1", false);
+	s.ch[2] = iio_device_find_channel(s.dev, "voltage0", false);
+	s.ch[3] = iio_device_find_channel(s.dev, "voltage1", false);
+	s.ch[4] = iio_device_find_channel(s.dev, "altvoltage0", false);
+	s.ch[5] = iio_device_find_channel(s.dev, "resistance0", false);
+	s.ch[6] = iio_device_find_channel(s.dev, "phase0", false);
 	for (int i = 0; i < NUM_CHANNELS; i++) {
-		if (!ch[i]) {
-			fprintf(stderr, "ERROR: Cannot find channel index %d\n", i);
+		if (!s.ch[i]) {
+			fprintf(stderr, "ERROR: Channel %d not found\n", i);
 			ret = 1;
 			goto cleanup;
 		}
 	}
 
-	/* ---- Get buffer (pre-allocated by kernel driver) ---- */
-	buf = iio_device_get_buffer(dev, 0);
-	if (iio_err(buf)) {
-		fprintf(stderr, "ERROR: Cannot get IIO buffer (index 0): %s\n",
-			strerror(-iio_err(buf)));
+	/* ---- Setup IIO buffer (persistent; stream is created per-round) ---- */
+	s.buf = iio_device_get_buffer(s.dev, 0);
+	if (iio_err(s.buf)) {
+		fprintf(stderr, "ERROR: Cannot get IIO buffer: %s\n",
+			strerror(-iio_err(s.buf)));
 		ret = 1;
 		goto cleanup;
 	}
 
-	/* ---- Create channels mask and enable channels ---- */
-	mask = iio_create_channels_mask(iio_device_get_channels_count(dev));
-	if (!mask) {
+	s.mask = iio_create_channels_mask(
+		iio_device_get_channels_count(s.dev));
+	if (!s.mask) {
 		fprintf(stderr, "ERROR: Cannot create channels mask\n");
 		ret = 1;
 		goto cleanup;
 	}
-
 	for (int i = 0; i < NUM_CHANNELS; i++)
-		iio_channel_enable(ch[i], mask);
+		iio_channel_enable(s.ch[i], s.mask);
 
-	/* ---- Create stream ---- */
-	/*
-	 * iio_buffer_create_stream: creates nb_blocks blocks, each holding
-	 * samples_count samples. For 1-sample-per-block low-latency reads,
-	 * use nb_blocks=4, samples_count=1.
-	 */
-	stream = iio_buffer_create_stream(buf, 4, 1, mask);
-	if (iio_err(stream)) {
-		fprintf(stderr, "ERROR: Cannot create IIO stream: %s\n",
-			strerror(-iio_err(stream)));
-		ret = 1;
-		goto cleanup;
-	}
-
-	// printf("\nCollecting %s samples (Ctrl-C to stop)...\n",
-	//        max_samples ? "up to N" : "continuous");
-	// printf("RTIA calibrated, Frequency from driver\n\n");
-	// printf("%-6s %10s %12s %12s %12s %12s %12s %12s %10s %10s  %s\n",
-	//        "#", "Freq(Hz)", "|Z|(Ohm)", "Phase(deg)", "R(Ohm)", "X(Ohm)",
-	//        "CurrMag", "VoltMag", "Rtia(Ohm)", "RtiaPh(d)", "CurrDFT(R/I) VoltDFT(R/I)");
-	// printf("------ ---------- ------------ ------------ ------------ ------------ "
-	//        "------------ ------------ ---------- ----------  -----------------------\n");
+	/* Stream will be created/destroyed per acquisition round by
+	 * acq_thread_fn, because iio_stream_cancel() permanently
+	 * invalidates a stream object. */
 
 	/* ---- Start communication thread ---- */
-	ret = pthread_create(&comm_thread, NULL, comm_thread_fn, NULL);
+	ret = pthread_create(&comm_tid, NULL, comm_thread_fn, NULL);
 	if (ret) {
 		fprintf(stderr, "ERROR: Cannot create comm thread: %s\n",
 			strerror(ret));
 		ret = 1;
 		goto cleanup;
 	}
-	comm_started = true;
 
-	/* ---- Main data acquisition loop ---- */
-	while (keep_running) {
-		const struct iio_block *block;
-
-		block = iio_stream_get_next_block(stream);
-		if (iio_err(block)) {
-			if (!keep_running)
-				break;
-			fprintf(stderr, "Stream read error: %s\n",
-				strerror(-iio_err(block)));
-			ret = 1;
-			break;
-		}
-		if (!block) {
-			/* Should not happen, but be safe */
-			break;
-		}
-
-		/*
-		 * Extract raw channel data using iio_channel_read().
-		 * raw=true: read samples in hardware format,
-		 *           no scale/offset conversion by libiio.
-		 * Channels 0-4 are 32-bit, channel 5 (RTIA mag) is 64-bit,
-		 * channel 6 (RTIA phase) is 32-bit.
-		 */
-		int32_t raw[NUM_CHANNELS];
-		int64_t raw_rtia_mag;
-		int32_t raw_rtia_phase;
-
-		for (int i = 0; i < 5; i++) {
-			size_t nr = iio_channel_read(ch[i], block,
-						     &raw[i], sizeof(int32_t),
-						     true);
-			if (nr < sizeof(int32_t)) {
-				fprintf(stderr, "Channel %d: short read (%zu)\n",
-					i, nr);
-				break;
-			}
-		}
-		/* RTIA magnitude: s64 milliohms */
-		iio_channel_read(ch[5], block, &raw_rtia_mag,
-				 sizeof(int64_t), true);
-		/* RTIA phase: s32 millidegrees */
-		iio_channel_read(ch[6], block, &raw_rtia_phase,
-				 sizeof(int32_t), true);
-
-		/* Sign-extend 18-bit DFT values */
-		int32_t curr_real = sign_extend_18bit((uint32_t)raw[0]);
-		int32_t curr_imag = sign_extend_18bit((uint32_t)raw[1]);
-		int32_t volt_real = sign_extend_18bit((uint32_t)raw[2]);
-		int32_t volt_imag = sign_extend_18bit((uint32_t)raw[3]);
-
-		/* Frequency channel: unsigned 32-bit Hz value from driver */
-		uint32_t freq_hz = (uint32_t)raw[4];
-
-		/* RTIA calibrated values from driver */
-		float rtia_mag_ohm = (float)raw_rtia_mag / 1000.0f;
-		float rtia_phase_deg = (float)raw_rtia_phase / 1000.0f;
-
-		/* Compute impedance with calibrated RTIA */
-		bia_sample_t sample;
-		compute_impedance(curr_real, curr_imag,
-				  volt_real, volt_imag,
-				  rtia_mag_ohm, rtia_phase_deg,
-				  freq_hz, &sample);
-
-		/* Diagnostic magnitudes */
-		float curr_mag = sqrtf((float)curr_real * curr_real +
-				       (float)curr_imag * curr_imag);
-		float volt_mag = sqrtf((float)volt_real * volt_real +
-				       (float)volt_imag * volt_imag);
-
-		sample_count++;
-		// printf("%-6d %10u %12.2f %12.2f %12.2f %12.2f %12.1f %12.1f %10.2f %10.2f  "
-		//        "(%d/%d) (%d/%d)\n",
-		//        sample_count, freq_hz, sample.magnitude, sample.phase,
-		//        sample.resistance, sample.reactance,
-		//        curr_mag, volt_mag,
-		//        rtia_mag_ohm, rtia_phase_deg,
-		//        curr_real, curr_imag, volt_real, volt_imag);
-
-		/* Push to ring buffer for communication thread */
-		ring_push(&g_ring, &sample);
-
-		if (max_samples > 0 && sample_count >= max_samples)
-			break;
+	/* ---- Start acquisition thread (will wait for START cmd) ---- */
+	ret = pthread_create(&acq_tid, NULL, acq_thread_fn, &s);
+	if (ret) {
+		fprintf(stderr, "ERROR: Cannot create acq thread: %s\n",
+			strerror(ret));
+		g_keep_running = 0;
+		pthread_cond_signal(&g_acquire_cond);
+		pthread_join(comm_tid, NULL);
+		ret = 1;
+		goto cleanup;
 	}
 
-	printf("\n--- Summary ---\n");
-	printf("Samples collected: %d\n", sample_count);
-	if (sample_count > 0)
-		printf("RTIA calibrated (values from driver)\n");
+	/* ---- Bind command socket ---- */
+	cmd_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+	if (cmd_fd < 0) {
+		fprintf(stderr, "[cmd] socket(): %s\n", strerror(errno));
+		goto cleanup_threads;
+	}
 
-	/* Wake comm thread so it can exit */
-	pthread_mutex_lock(&g_ring.mutex);
+	unlink(BIA_CMD_SOCK_PATH);
+	struct sockaddr_un cmd_addr;
+	memset(&cmd_addr, 0, sizeof(cmd_addr));
+	cmd_addr.sun_family = AF_UNIX;
+	strncpy(cmd_addr.sun_path, BIA_CMD_SOCK_PATH, sizeof(cmd_addr.sun_path) - 1);
+
+	if (bind(cmd_fd, (struct sockaddr *)&cmd_addr, sizeof(cmd_addr)) < 0) {
+		fprintf(stderr, "[cmd] bind(%s): %s\n",
+			BIA_CMD_SOCK_PATH, strerror(errno));
+		close(cmd_fd);
+		cmd_fd = -1;
+		goto cleanup_threads;
+	}
+
+	/* Set receive buffer size */
+	int rcvbuf = 4096;
+	setsockopt(cmd_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+	printf("[demo] Daemon ready. Listening on %s\n", BIA_CMD_SOCK_PATH);
+	printf("[demo] Commands: S=START T=STOP ?=STATUS Q=QUIT\n");
+
+	/* ---- Command loop ---- */
+	while (g_keep_running) {
+		char cmd;
+		ssize_t n = recvfrom(cmd_fd, &cmd, 1, 0, NULL, NULL);
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			if (errno == ECONNREFUSED || errno == ENOENT)
+				continue;	/* nobody bound yet, normal */
+			fprintf(stderr, "[cmd] recvfrom: %s\n", strerror(errno));
+			continue;
+		}
+		if (n == 0)
+			continue;
+
+		switch (cmd) {
+		case CMD_START:
+			read_sweep_params();
+			pthread_mutex_lock(&g_state_mtx);
+			g_acquiring = 1;
+			pthread_cond_signal(&g_acquire_cond);
+			pthread_mutex_unlock(&g_state_mtx);
+			printf("[cmd] → START (points=%d)\n", g_sweep_points);
+			break;
+
+		case CMD_STOP:
+			/*
+			 * Cancel the stream to unblock iio_stream_get_next_block().
+			 * Stream may already be NULL if acq thread auto-stopped
+			 * after sweep_points (safe to call with NULL check).
+			 */
+			if (s.stream)
+				iio_stream_cancel(s.stream);
+			pthread_mutex_lock(&g_state_mtx);
+			g_acquiring = 0;
+			pthread_mutex_unlock(&g_state_mtx);
+			printf("[cmd] → STOP\n");
+			break;
+
+		case CMD_STATUS: {
+			/* Reply: send sweep_points as uint32 LE */
+			uint32_t sp = (uint32_t)(g_acquiring ?
+					g_sweep_points : 0);
+			struct sockaddr_un reply_addr;
+			socklen_t alen = sizeof(reply_addr);
+			/* Peek sender address by doing a throwaway recv?
+			 * Simpler: just send back to known Qt data socket */
+			sendto(cmd_fd, &sp, sizeof(sp), 0,
+			       (struct sockaddr *)&cmd_addr, sizeof(cmd_addr));
+			break;
+		}
+
+		case CMD_QUIT:
+			printf("[cmd] → QUIT\n");
+			g_keep_running = 0;
+			pthread_mutex_lock(&g_state_mtx);
+			g_acquiring = 0;
+			pthread_cond_signal(&g_acquire_cond);
+			pthread_mutex_unlock(&g_state_mtx);
+			break;
+
+		default:
+			printf("[cmd] Unknown: 0x%02x ('%c')\n",
+			       (unsigned char)cmd, cmd);
+			break;
+		}
+	}
+
+cleanup_threads:
+	/* Signal all threads to exit */
+	g_keep_running = 0;
+	pthread_cond_signal(&g_acquire_cond);
+	/* Wake ring buffer so comm thread exits */
 	pthread_cond_signal(&g_ring.cond);
-	pthread_mutex_unlock(&g_ring.mutex);
 
-	if (comm_started)
-		pthread_join(comm_thread, NULL);
+	if (acq_tid)
+		pthread_join(acq_tid, NULL);
+	pthread_join(comm_tid, NULL);
+
+	if (cmd_fd >= 0)
+		close(cmd_fd);
+	unlink(BIA_CMD_SOCK_PATH);
 
 cleanup:
-	if (stream)
-		iio_stream_destroy(stream);
-	if (mask)
-		iio_channels_mask_destroy(mask);
-	if (ctx)
-		iio_context_destroy(ctx);
+	/* Stream is created/destroyed per round in acq_thread_fn;
+	 * s.stream should be NULL here unless we exited early. */
+	if (s.stream)
+		iio_stream_destroy(s.stream);
+	if (s.mask)
+		iio_channels_mask_destroy(s.mask);
+	/* s.buf and s.channels are owned by s.ctx */
+	if (s.ctx)
+		iio_context_destroy(s.ctx);
 
+	printf("[demo] Exited.\n");
 	return ret;
 }

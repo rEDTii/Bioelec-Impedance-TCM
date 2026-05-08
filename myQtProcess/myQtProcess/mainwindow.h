@@ -4,7 +4,6 @@
 #include <QMainWindow>
 #include <QSocketNotifier>
 #include <QMap>
-#include <QProcess>
 #include <QPushButton>
 #include <QLabel>
 #include <QtCharts/QChartView>
@@ -14,35 +13,37 @@
 #include <QtCharts/QValueAxis>
 
 /* Must match ad5940_bia_demo.c */
-#define BIA_SOCK_PATH  "/tmp/bia_sample.sock"
+#define BIA_DATA_SOCK_PATH  "/tmp/bia_sample.sock"
+#define BIA_CMD_SOCK_PATH   "/tmp/bia_cmd.sock"
 
-/* IIO sysfs paths — may be device0 or device1, auto-detected */
-#define IIO_DEVICE_GLOB  "/sys/bus/iio/devices/iio:device*"
+/* Command bytes (single-char datagrams) */
+#define CMD_START  'S'
+#define CMD_STOP   'T'
+#define CMD_STATUS '?'
+#define CMD_QUIT   'Q'
 
-/*
- * Search paths for ad5940_bia_demo, tried in order.
- * Edit if your deployment puts the binary elsewhere.
- */
-static const char * const DEMO_BIN_PATHS[] = {
-    "/mydrivers/ad5940_bia_demo", // 开发时使用的目录
-    "/usr/local/bin/ad5940_bia_demo",
-    "/usr/bin/ad5940_bia_demo",
-    "/opt/ad5940/ad5940_bia_demo",
-    "./ad5940_bia_demo",
-};
+/* Meta-info magic: distinguishes meta packet from data sample */
+#define BIA_META_MAGIC  0xB1A00000u
 
 QT_CHARTS_USE_NAMESPACE
 
 struct bia_sample_t {
-    float magnitude;     /* |Z| in Ohms */
-    float phase;         /* angle(Z) in degrees */
-    float resistance;    /* Real part R in Ohms */
-    float reactance;     /* Imaginary part X in Ohms */
-    quint32 freq_hz;     /* Excitation frequency in Hz */
-    qint32 curr_real;    /* Raw DFT: current channel real part (18-bit signed) */
-    qint32 curr_imag;    /* Raw DFT: current channel imaginary part */
-    qint32 volt_real;    /* Raw DFT: voltage channel real part */
-    qint32 volt_imag;    /* Raw DFT: voltage channel imaginary part */
+    float magnitude;
+    float phase;
+    float resistance;
+    float reactance;
+    quint32 freq_hz;
+    qint32 curr_real;
+    qint32 curr_imag;
+    qint32 volt_real;
+    qint32 volt_imag;
+};
+
+/* Sent by demo before first data after each START */
+struct bia_meta_t {
+    quint32 magic;         /* = BIA_META_MAGIC */
+    quint32 sweep_points;  /* number of frequency points */
+    quint32 sweep_type;    /* 0=linear, 1=log, 2=custom */
 };
 
 QT_BEGIN_NAMESPACE
@@ -60,23 +61,19 @@ public:
 private slots:
     void onToggleButton();
     void onDataReady();
-    void onDemoFinished(int exitCode, QProcess::ExitStatus status);
 
 private:
     void initChart();
-    void initSocket();
-    void refreshChart();
+    void initDataSocket();
+    bool sendCommand(char cmd);
     void startAcquisition();
     void stopAcquisition();
     void setAcquiring(bool on);
-
-    int  readSweepPoints();
-    QString findIioDevice();
-    bool enableIioBuffer(bool enable);
+    void refreshChart();
 
     Ui::MainWindow *ui;
 
-    /* Socket */
+    /* Data socket (receives samples from demo) */
     int m_dataFd = -1;
     QSocketNotifier *m_notifier = nullptr;
 
@@ -95,10 +92,8 @@ private:
     /* Acquisition control */
     QPushButton *m_btnToggle = nullptr;
     QLabel *m_statusLabel = nullptr;
-    QProcess *m_demoProcess = nullptr;
     bool m_acquiring = false;
-    int m_sweepPoints = 0;      /* 0 = not yet read */
-    int m_receivedPoints = 0;   /* unique freq points received this round */
-    QString m_iioDevicePath;    /* e.g. /sys/bus/iio/devices/iio:device1 */
+    int m_sweepPoints = 0;
+    int m_receivedPoints = 0;
 };
 #endif // MAINWINDOW_H

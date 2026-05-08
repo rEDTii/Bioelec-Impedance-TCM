@@ -212,9 +212,9 @@ static const struct iio_chan_spec ad5940_dft_channels[] = {
 static int ad5940_trigger_set_state(struct iio_trigger *trig, bool state)
 {
 	struct ad5940_priv *priv = iio_trigger_get_drvdata(trig);
-	struct device *dev = &priv->spi->dev;
+	// struct device *dev = &priv->spi->dev;
 
-	dev_info(dev, "trigger_set_state: %s\n", state ? "ENABLE" : "DISABLE");
+	// dev_info(dev, "trigger_set_state: %s\n", state ? "ENABLE" : "DISABLE");
 
 	if (state)
 		return ad5940_bia_start(priv);
@@ -678,8 +678,13 @@ static int ad5940_probe(struct spi_device *spi)
 	priv->sweep_start_hz = sweep_start_hz;
 	priv->sweep_stop_hz = sweep_stop_hz;
 	if (priv->sweep_type == AD5940_SWEEP_CUSTOM) {
-		/* Custom table: points = table size, ignore start/stop/points */
+		/* Custom table: points = table size, ignore start/stop/points.
+		 * Also update the module parameter so userspace reading
+		 * /sys/module/ad5940/parameters/sweep_points gets the
+		 * actual custom table size instead of the stale default.
+		 */
 		priv->sweep_points = AD5940_BIA_CUSTOM_FREQ_COUNT;
+		sweep_points = priv->sweep_points;
 	} else {
 		/* 钳位(clamp): 将 sweep_points 限制在 [1, AD5940_MAX_SWEEP_POINTS] 范围内 */
 		priv->sweep_points = clamp_val(sweep_points, 1,
