@@ -82,7 +82,7 @@ AD5940 的 ADC/DFT 滤波器参数在不同频段差异巨大（低频需 SINC2+
 - 硬中断（GPIO 下降沿）→ `disable_irq_nosync` 防重入 → `iio_trigger_poll` 调度线程化 handler → FIFO 批量读取 + 扫频步进 → `iio_trigger_notify_done` 重新使能 IRQ
 - 扫频计数逻辑：自动检测一轮扫频完成后停止 buffer，防止数据回绕
 
-### 2.4 三线程生产者-消费者解耦架构
+### 2.4 多线程生产者-消费者解耦架构
 
 用户态守护进程采用三线程 + 环形缓冲区架构，将采集、通信与命令控制解耦：
 - **main_thread**：绑定命令 Socket（`/tmp/bia_cmd.sock`），接收 Qt 端 S/T/?/Q 命令，控制采集启停
