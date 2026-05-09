@@ -1,13 +1,17 @@
 /*
- * AD5940 BIA User-Space Demo — Daemon mode with command socket
+ * AD5940 BIA User-Space Daemon — command socket + data streaming
  *
  * Built against libiio v1.0 API (stream model).
  *
- * Architecture:
- *   ┌──────────┐   cmd DGRAM   ┌────────────────────┐   data DGRAM   ┌─────────┐
- *   │  Qt GUI  │ ◄────────────►│  ad5940_bia_daemon │◄───────────────│ AD5940  │
+ * Architecture (3 threads):
+ *   ┌──────────┐  cmd DGRAM→   ┌────────────────────┐   data DGRAM→  ┌─────────┐
+ *   │  Qt GUI  │ ──────────►   │  ad5940_bia_daemon │◄────────────── │ AD5940  │
  *   │          │  S/T/?/Q      │  (this program)    │  IIO stream    │ driver  │
- *   └──────────┘               └────────────────────┘                └─────────┘
+ *   └──────────┘◄─data DGRAM── └────────────────────┘                └─────────┘
+ *   Threads:
+ *     main_thread  — bind cmd socket, receive S/T/?/Q commands
+ *     acq_thread   — libiio stream read + impedance calc + ring_push (producer)
+ *     comm_thread  — ring_pop + sendto data socket (consumer)
  *
  * Commands (single-byte datagrams on /tmp/bia_cmd.sock):
  *   'S' — START acquisition (enable IIO buffer, begin streaming)

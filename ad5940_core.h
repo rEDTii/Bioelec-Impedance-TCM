@@ -447,14 +447,14 @@
 /*
  * HSTIA RTIA feedback resistor selection.
  * Must be one of: AD5940_HSTIARTIA_200, _1K, _5K, _10K, _20K, _40K, _80K, _160K
- * Default: 5K (matches ADI evaluation boards)
+ * Default: 1K (suitable for skin impedance range ~100Ω–10kΩ)
  */
 #define AD5940_BIA_RTIA_SEL		AD5940_HSTIARTIA_1K
 
 /*
  * CTIA (compensation capacitor) selection for HSTIA.
  * Range: 0..31. Larger values provide better stability for larger RTIA.
- * Default: 31 (recommended for 5K and above)
+ * Default: 31 (recommended for 1K and above)
  */
 #define AD5940_BIA_RTIA_CTIA		31
 

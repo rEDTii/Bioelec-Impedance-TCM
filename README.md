@@ -18,9 +18,9 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │                        用户态 (Userspace)                       │
 │                                                                │
-│   ┌──────────────────┐   Unix DGRAM   ┌────────────────────┐   │
-│   │   Qt GUI 前端    │ ◄────────────► │  ad5940_bia_daemon │   │
-│   │  (mainwindow)    │ /tmp/bia_*.sock│  (C 后端)          │   │
+│   ┌──────────────────┐  cmd DGRAM→   ┌────────────────────┐   │
+│   │   Qt GUI 前端    │ ───────────►  │  ad5940_bia_daemon │   │
+│   │  (mainwindow)    │ ←data DGRAM─  │  (C 后端)          │   │
 │   └──────────────────┘                └─────────┬──────────┘   │
 │                                                │ libiio        │
 │                                                │ IIO buffer    │
@@ -30,7 +30,7 @@
 │                                    └───────────┬───────────┘   │
 └────────────────────────────────────────────────┼───────────────┘
                                                  │
-                   内核/用户边界                   │
+                   内核/用户边界                  │
                                                  │
 ┌────────────────────────────────────────────────┼───────────────┐
 │                        内核态 (Kernel)          │               │
@@ -55,7 +55,7 @@
 └────────────────────────────────────────────────────────────────┘
 ```
 
-**核心数据流**：WUPT 周期触发 → AFE 序列器执行测量 → FIFO 达阈值 → GP0 中断 → 内核 IRQ handler → IIO trigger handler 读取 FIFO → iio_push_to_buffers → 用户态 libiio stream → 阻抗计算 → Qt 绘图。
+**核心数据流**：Qt 发送 START 命令（`/tmp/bia_cmd.sock`）→ WUPT 周期触发 → AFE 序列器执行测量 → FIFO 达阈值 → GP0 中断 → 内核 IRQ handler → IIO trigger handler 读取 FIFO → iio_push_to_buffers → 用户态 libiio stream → 阻抗计算 → 数据推送（`/tmp/bia_sample.sock`）→ Qt 绘图。
 
 ---
 
@@ -82,11 +82,12 @@ AD5940 的 ADC/DFT 滤波器参数在不同频段差异巨大（低频需 SINC2+
 - 硬中断（GPIO 下降沿）→ `disable_irq_nosync` 防重入 → `iio_trigger_poll` 调度线程化 handler → FIFO 批量读取 + 扫频步进 → `iio_trigger_notify_done` 重新使能 IRQ
 - 扫频计数逻辑：自动检测一轮扫频完成后停止 buffer，防止数据回绕
 
-### 2.4 生产者-消费者解耦架构
+### 2.4 三线程生产者-消费者解耦架构
 
-用户态守护进程采用双线程 + 环形缓冲区架构，将采集与通信解耦：
+用户态守护进程采用三线程 + 环形缓冲区架构，将采集、通信与命令控制解耦：
+- **main_thread**：绑定命令 Socket（`/tmp/bia_cmd.sock`），接收 Qt 端 S/T/?/Q 命令，控制采集启停
 - **acq_thread**：阻塞式 libiio stream 读取 + 阻抗计算 + ring_push（生产者）
-- **comm_thread**：ring_pop + sendto 数据 Socket（消费者），首包发送 `bia_meta_t` 元信息
+- **comm_thread**：ring_pop + sendto 数据 Socket（`/tmp/bia_sample.sock`，消费者），首包发送 `bia_meta_t` 元信息
 - **环形缓冲区**：16 槽位，满则丢弃最旧数据，空则条件等待，兼顾实时性与可靠性
 
 ### 2.5 开机自启动与 Weston 异步等待
@@ -186,8 +187,10 @@ ad5940_driver/
 | `sweep_en` | bool | true | 使能扫频模式 |
 | `sweep_start_hz` | uint | 10 | 扫频起始频率 (Hz) |
 | `sweep_stop_hz` | uint | 200 | 扫频终止频率 (Hz) |
-| `sweep_points` | uint | 15 | 扫频点数 |
+| `sweep_points` | uint | 15† | 扫频点数 |
 | `sweep_type` | uint | 2 | 扫频类型：0=线性，1=对数，2=自定义频率表 |
+
+> **†** `sweep_points` 默认值 15 对线性/对数模式有效；自定义频率表模式（`sweep_type=2`）下，probe 时自动覆盖为频率表长度（当前 12 个频点）。
 
 **示例**：线性扫频 20Hz ~ 100kHz：
 ```bash
