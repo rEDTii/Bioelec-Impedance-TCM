@@ -1,4 +1,5 @@
 #!/bin/sh
+# 调试用脚本，开启数据缓冲区，用于测试和调试
 
 DEVICE="/sys/bus/iio/devices/iio:device1"
 

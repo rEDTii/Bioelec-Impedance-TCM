@@ -1,6 +1,6 @@
 #!/bin/sh
-# 嵌入式Linux专用CPU测试脚本 (兼容所有busybox，零错误)
-# 采样10秒，输出内核CPU占用（DMA核心指标）
+# 调试用脚本，测试CPU占用 (兼容busybox)
+# 采样10秒，输出内核CPU占用
 
 echo "采样10秒CPU数据 请勿操作..."
 
