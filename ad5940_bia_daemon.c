@@ -5,9 +5,9 @@
  *
  * Architecture:
  *   ┌──────────┐   cmd DGRAM   ┌────────────────────┐   data DGRAM   ┌─────────┐
- *   │  Qt GUI  │ ◄────────────►│  ad5940_bia_demo    │◄───────────────│ AD5940  │
- *   │          │  S/T/?/Q      │  (this program)     │  IIO stream    │ driver  │
- *   └──────────┘               └────────────────────┘                 └─────────┘
+ *   │  Qt GUI  │ ◄────────────►│  ad5940_bia_daemon │◄───────────────│ AD5940  │
+ *   │          │  S/T/?/Q      │  (this program)    │  IIO stream    │ driver  │
+ *   └──────────┘               └────────────────────┘                └─────────┘
  *
  * Commands (single-byte datagrams on /tmp/bia_cmd.sock):
  *   'S' — START acquisition (enable IIO buffer, begin streaming)
@@ -22,13 +22,13 @@
  * Cross-compile for RK3568 (aarch64):
  *   TOOLCHAIN=path/to/aarch64-linux-gnu
  *   LIBIIO=../libiio/install
- *   ${TOOLCHAIN}-gcc -o ad5940_bia_demo ad5940_bia_demo.c \
+ *   ${TOOLCHAIN}-gcc -o ad5940_bia_daemon ad5940_bia_daemon.c \
  *       -I${LIBIIO}/include/iio \
  *       -L${LIBIIO}/lib \
  *       -liio -lm -lpthread -lrt -static
  *
  * Usage:
- *   ./ad5940_bia_demo     # daemon mode: listen on cmd sock, wait for START
+ *   ./ad5940_bia_daemon    # daemon mode: listen on cmd sock, wait for START
  */
 
 #include <stdio.h>

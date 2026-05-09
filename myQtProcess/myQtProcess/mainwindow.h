@@ -12,7 +12,7 @@
 #include <QtCharts/QLogValueAxis>
 #include <QtCharts/QValueAxis>
 
-/* Must match ad5940_bia_demo.c */
+/* Must match ad5940_bia_daemon.c */
 #define BIA_DATA_SOCK_PATH  "/tmp/bia_sample.sock"
 #define BIA_CMD_SOCK_PATH   "/tmp/bia_cmd.sock"
 

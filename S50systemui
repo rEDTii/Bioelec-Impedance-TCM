@@ -1,0 +1,233 @@
+#!/bin/sh
+#
+# S50systemui — AD5940 BIA + Qt GUI 开机自启动脚本 (替代 Buildroot 默认 systemui)
+#
+# 启动顺序:
+#   1) 加载 ad5940.ko 内核模块 (insmod 阻塞至 probe 完成)
+#   2) 轮询等待 IIO 设备就绪 (probe + RTIA 校准完成)
+#   3) 启动 ad5940_bia_daemon (后台守护进程)
+#   4) 启动 Qt GUI 前端 (后台等待 weston 就绪后启动)
+#
+# 安装:
+#   cp S50systemui /etc/init.d/S50systemui
+#   chmod +x /etc/init.d/S50systemui
+#
+# 手动测试:
+#   /etc/init.d/S50systemui start
+#   /etc/init.d/S50systemui stop
+#   /etc/init.d/S50systemui restart
+#
+
+# ====================== 可配置变量 ======================
+
+# 内核模块路径
+MODULE_PATH="/mydrivers/ad5940.ko"
+# 模块参数 (不传参数则留空)
+# 留空示例: MODULE_PARAMS=""
+# MODULE_PARAMS="sweep_type=0 sweep_start_hz=2200 sweep_stop_hz=100000"
+MODULE_PARAMS=""
+
+# 可执行文件路径 (根据实际部署修改)
+DAEMON_BIN="/mydrivers/ad5940_bia_daemon"
+QT_BIN="/mydrivers/myQtProcess"
+
+# PID 文件路径 (记录进程号，用于 stop 时精确杀进程)
+DAEMON_PID="/var/run/ad5940_daemon.pid"
+QT_PID="/var/run/ad5940_qt.pid"
+
+# 轮询检测 IIO 设备就绪的参数
+POLL_INTERVAL=1     # 每次检测间隔 (秒)
+POLL_TIMEOUT=120    # 最大等待时间 (秒)，兼容毫秒级到 1min 级校准
+
+# 日志文件 (启动日志记录到这里，用来诊断开机自启动问题)
+LOG="/var/log/ad5940_bia.log"
+
+# ====================== 环境 & 工具 ======================
+
+PATH="/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin"
+
+# 加载系统环境变量 (QT_QPA_PLATFORM=wayland, XDG_RUNTIME_DIR 等)
+. /etc/profile
+
+# log — 同时输出到控制台和日志文件
+log()
+{
+    echo "$@" | tee -a "$LOG"
+}
+log_err()
+{
+    echo "$@" | tee -a "$LOG" >&2
+}
+
+# ====================== 函数定义 ======================
+
+# ---------------------------------------------------------------
+# wait_for_device — 轮询等待 AD5940 IIO 设备出现
+#
+# 驱动 probe 的最后一步才调用 iio_device_register()，
+# 所以 /sys/bus/iio/devices/ 下出现 name=ad5940 的设备
+# 就等价于 "probe + 校准完成"。
+# 无论校准耗时几毫秒还是一分钟，都能精确等待，不浪费也不超时。
+# ---------------------------------------------------------------
+wait_for_device()
+{
+    local elapsed=0
+
+    while [ "$elapsed" -lt "$POLL_TIMEOUT" ]; do
+        for d in /sys/bus/iio/devices/iio:device*/name; do
+            if [ -r "$d" ] && grep -q '^ad5940$' "$d" 2>/dev/null; then
+                log "[ad5940] IIO device ready (waited ${elapsed}s)"
+                return 0
+            fi
+        done
+
+        sleep "$POLL_INTERVAL"
+        elapsed=$((elapsed + POLL_INTERVAL))
+    done
+
+    log_err "[ad5940] ERROR: device not ready after ${POLL_TIMEOUT}s"
+    return 1
+}
+
+# ---------------------------------------------------------------
+# load_module — 加载内核模块
+# ---------------------------------------------------------------
+load_module()
+{
+    log "[ad5940] Loading kernel module..."
+    if [ ! -f "$MODULE_PATH" ]; then
+        log_err "[ad5940] ERROR: module not found: $MODULE_PATH"
+        return 1
+    fi
+    insmod "$MODULE_PATH" $MODULE_PARAMS
+    return $?
+}
+
+# ---------------------------------------------------------------
+# unload_module — 卸载内核模块
+# ---------------------------------------------------------------
+unload_module()
+{
+    rmmod ad5940 2>/dev/null
+}
+
+# ---------------------------------------------------------------
+# start_daemon — 启动 daemon 进程
+# ---------------------------------------------------------------
+start_daemon()
+{
+    if [ ! -x "$DAEMON_BIN" ]; then
+        log_err "[ad5940] ERROR: daemon not found: $DAEMON_BIN"
+        return 1
+    fi
+    log "[ad5940] Starting daemon..."
+    start-stop-daemon -S -b -m -p "$DAEMON_PID" \
+        -x "$DAEMON_BIN"
+}
+
+# ---------------------------------------------------------------
+# start_qt — 启动 Qt GUI 前端 (后台等待 weston 就绪)
+#
+# 关键问题: 本脚本 (S50) 执行时 weston 还没启动。
+#   - insmod 快 (几ms) → init 继续跑，但 weston 在后续 S* 才启动
+#   - insmod 慢 (~60s) → init 卡在 S50，weston 更不可能就绪
+# 两种情况都不能同步启动 Qt，必须在后台等 weston 就绪后再启动。
+#
+# 方案: ( ... ) & 后台子进程
+#   - init 脚本立即返回，后续 S* 脚本（包括 weston）得以执行
+#   - 子进程轮询 wayland-0 socket，等 weston 就绪后启动 Qt
+# ---------------------------------------------------------------
+start_qt()
+{
+    if [ ! -x "$QT_BIN" ]; then
+        log_err "[ad5940] ERROR: Qt app not found: $QT_BIN"
+        return 1
+    fi
+
+    log "[ad5940] Qt GUI will start when weston is ready..."
+
+    # 后台等待 weston 就绪后启动 Qt (不阻塞 init)
+    (
+        if [ "${QT_QPA_PLATFORM}" = "wayland" ]; then
+            # Wayland: 轮询等待 weston socket 出现
+            while [ ! -e "${XDG_RUNTIME_DIR}/wayland-0" ]; do
+                sleep 0.5
+            done
+            # socket 出现后 compositor 可能还没完全初始化，等 2s
+            sleep 2
+            log "[ad5940] Weston ready, starting Qt GUI..."
+        else
+            # 非 wayland (eglfs/linuxfb): 短暂等待即可
+            sleep 2
+            log "[ad5940] Starting Qt GUI..."
+        fi
+
+        start-stop-daemon -S -b -m -p "$QT_PID" \
+            -x "$QT_BIN"
+    ) &
+}
+
+# ---------------------------------------------------------------
+# stop_daemon / stop_qt — 停止进程
+# ---------------------------------------------------------------
+stop_daemon()
+{
+    start-stop-daemon -K -p "$DAEMON_PID" -x "$DAEMON_BIN" 2>/dev/null
+    rm -f "$DAEMON_PID"
+}
+
+stop_qt()
+{
+    start-stop-daemon -K -p "$QT_PID" -x "$QT_BIN" 2>/dev/null
+    rm -f "$QT_PID"
+}
+
+# ====================== 主入口 ======================
+
+start()
+{
+    # Step 1: 加载内核模块
+    if ! load_module; then
+        return 1
+    fi
+
+    # Step 2: 等待 probe + RTIA 校准完成 (兼容几ms到60s)
+    log "[ad5940] Waiting for probe + RTIA calibration..."
+    if ! wait_for_device; then
+        log_err "[ad5940] Calibration may have failed, aborting"
+        return 1
+    fi
+
+    # Step 3: 启动 daemon
+    start_daemon
+
+    # Step 4: 启动 Qt 前端 (后台等待 weston 就绪，不阻塞 init)
+    start_qt
+
+    log "[ad5940] Startup complete."
+}
+
+stop()
+{
+    log "[ad5940] Stopping..."
+    stop_qt
+    stop_daemon
+    unload_module
+    log "[ad5940] Stopped."
+}
+
+restart()
+{
+    stop
+    start
+}
+
+case "$1" in
+    start)   start   ;;
+    stop)    stop    ;;
+    restart) restart ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

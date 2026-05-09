@@ -18,7 +18,7 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * sendCommand — Send a single-byte command to ad5940_bia_demo.
+ * sendCommand — Send a single-byte command to ad5940_bia_daemon.
  * Uses DGRAM (connectionless), so open → send → close each time.
  */
 bool MainWindow::sendCommand(char cmd)
@@ -60,7 +60,7 @@ void MainWindow::startAcquisition()
     if (!sendCommand(CMD_START)) {
         QMessageBox::warning(this, tr("Error"),
                              tr("Failed to send START command.\n"
-                                "Is ad5940_bia_demo running?\n"
+                                "Is ad5940_bia_daemon running?\n"
                                 "Listening on %1").arg(BIA_CMD_SOCK_PATH));
         return;
     }
