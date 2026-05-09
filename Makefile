@@ -14,14 +14,12 @@ LIBIIO_INSTALL := $(CURRENT_PATH)/libiio/install
 ad5940-objs := ad5940_drv.o ad5940_core.o
 obj-m := ad5940.o
 
-build: kernel_modules user_daemon user_dummy
+build: kernel_modules user_daemon
 
 kernel_modules:
 	$(MAKE) -C $(KERNELDIR) M=$(CURRENT_PATH) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
 
 user_daemon: ad5940_bia_daemon
-
-user_dummy: dummy_Qt
 
 ad5940_bia_daemon: ad5940_bia_daemon.c
 	$(CC) -o $@ $< \
@@ -29,11 +27,8 @@ ad5940_bia_daemon: ad5940_bia_daemon.c
 		-L$(LIBIIO_INSTALL)/lib \
 		-liio -lm -lpthread -lrt -static
 
-dummy_Qt: dummy_Qt.c
-	$(CC) -o $@ $< -static
-
 clean:
-	rm -f ad5940_bia_daemon dummy_Qt
+	rm -f ad5940_bia_daemon
 	rm -f ad5940_drv.o ad5940_core.o ad5940.o ad5940.ko ad5940.mod.o ad5940.mod.c
 	rm -f modules.order Module.symvers .ad5940.o.cmd .ad5940.mod.o.cmd .ad5940.ko.cmd
 	rm -f .ad5940_core.o.cmd .ad5940_drv.o.cmd

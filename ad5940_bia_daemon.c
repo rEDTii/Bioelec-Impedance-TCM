@@ -57,6 +57,9 @@
 #define BIA_DATA_SOCK_PATH	"/tmp/bia_sample.sock"
 #define BIA_CMD_SOCK_PATH	"/tmp/bia_cmd.sock"
 
+/* Sample log file — always writable regardless of stdout destination */
+#define BIA_SAMPLE_LOG_PATH	"/var/log/ad5940_samples.log"
+
 /* Command bytes (single-char datagrams) */
 #define CMD_START		'S'
 #define CMD_STOP		'T'
@@ -156,6 +159,8 @@ static volatile int g_sweep_type = 0;		/* read from sysfs at START */
 static pthread_mutex_t g_state_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_acquire_cond = PTHREAD_COND_INITIALIZER;
 
+static FILE *g_sample_log = NULL;	/* dedicated sample log file */
+
 static void sigint_handler(int sig)
 {
 	(void)sig;
@@ -188,7 +193,7 @@ static void read_sweep_params(void)
 	int st = read_sysfs_int("/sys/module/ad5940/parameters/sweep_type");
 	g_sweep_type = (st >= 0 && st <= 2) ? st : 0;
 
-	printf("[demo] sweep_points=%d, sweep_type=%d\n",
+	printf("[daemon] sweep_points=%d, sweep_type=%d\n",
 	       g_sweep_points, g_sweep_type);
 }
 
@@ -337,14 +342,14 @@ static int enable_iio_buffer(struct iio_device *dev, bool en)
 		 iio_device_get_id(dev));
 	FILE *f = fopen(path, "w");
 	if (!f) {
-		fprintf(stderr, "[demo] Cannot open %s: %s\n",
+		fprintf(stderr, "[daemon] Cannot open %s: %s\n",
 			path, strerror(errno));
 		return -1;
 	}
 	int ok = (fwrite(val, 1, 1, f) == 1);
 	fclose(f);
 
-	printf("[demo] IIO buffer %s (%s)\n",
+	printf("[daemon] IIO buffer %s (%s)\n",
 	       en ? "ENABLED" : "DISABLED", path);
 	return ok ? 0 : -1;
 }
@@ -375,7 +380,7 @@ static void *acq_thread_fn(void *arg)
 		 */
 		s->stream = iio_buffer_create_stream(s->buf, 4, 1, s->mask);
 		if (iio_err(s->stream)) {
-			fprintf(stderr, "[demo] Cannot create stream: %s\n",
+			fprintf(stderr, "[daemon] Cannot create stream: %s\n",
 				strerror(-iio_err(s->stream)));
 			pthread_mutex_lock(&g_state_mtx);
 			g_acquiring = 0;
@@ -384,6 +389,15 @@ static void *acq_thread_fn(void *arg)
 		}
 
 		sample_count = 0;
+
+		printf("\n===== Acquisition STARTED (expecting %d points) =====\n\n",
+		       g_sweep_points);
+		if (g_sample_log) {
+			fprintf(g_sample_log,
+				"\n===== Acquisition STARTED (expecting %d points) =====\n\n",
+				g_sweep_points);
+			fflush(g_sample_log);
+		}
 
 		/*
 		 * ---- Acquisition loop ----
@@ -405,7 +419,7 @@ static void *acq_thread_fn(void *arg)
 			if (!block || iio_err(block)) {
 				if (!g_keep_running || !g_acquiring)
 					break;	/* Expected: STOP cancelled */
-				fprintf(stderr, "[demo] Stream error: %s\n",
+				fprintf(stderr, "[daemon] Stream error: %s\n",
 					iio_err(block) ?
 					strerror(-iio_err(block)) : "null");
 				break;
@@ -447,6 +461,31 @@ static void *acq_thread_fn(void *arg)
 			ring_push(&g_ring, &sample);
 			sample_count++;
 
+			/* ---- Terminal: print real-time sample data ---- */
+			printf("[%2d/%d] %6u Hz  |Z|=%10.2fΩ  Ph=%+8.2f° "
+			       "R=%10.2fΩ  X=%+10.2fΩ  "
+			       "(I:%+d,%+d  V:%+d,%+d  Rtia=%.1fmΩ/%.1fmdeg)\n",
+			       sample_count, g_sweep_points,
+			       sample.freq_hz,
+			       sample.magnitude, sample.phase,
+			       sample.resistance, sample.reactance,
+			       cr, ci, vr, vi,
+			       rtm, rtp);
+			fflush(stdout);
+			if (g_sample_log) {
+				fprintf(g_sample_log,
+					"[%2d/%d] %6u Hz  |Z|=%10.2f  Ph=%+8.2f "
+					"R=%10.2f  X=%+10.2f  "
+					"(I:%+d,%+d  V:%+d,%+d  Rtia=%.1fm/%.1fmd)\n",
+					sample_count, g_sweep_points,
+					sample.freq_hz,
+					sample.magnitude, sample.phase,
+					sample.resistance, sample.reactance,
+					cr, ci, vr, vi,
+					rtm, rtp);
+				fflush(g_sample_log);
+			}
+
 			/*
 			 * ---- Auto-stop: one sweep round complete ----
 			 * The driver's sweep_index wraps around to 0 after
@@ -456,8 +495,14 @@ static void *acq_thread_fn(void *arg)
 			 */
 			if (g_sweep_points > 0 &&
 			    sample_count >= g_sweep_points) {
-				printf("[demo] Sweep complete: %d/%d samples\n",
+				printf("\n===== Sweep COMPLETE: %d/%d samples collected =====\n\n",
 				       sample_count, g_sweep_points);
+				if (g_sample_log) {
+					fprintf(g_sample_log,
+						"\n===== Sweep COMPLETE: %d/%d samples collected =====\n\n",
+						sample_count, g_sweep_points);
+					fflush(g_sample_log);
+				}
 				break;
 			}
 		}
@@ -476,7 +521,7 @@ static void *acq_thread_fn(void *arg)
 		g_acquiring = 0;
 		pthread_mutex_unlock(&g_state_mtx);
 
-		printf("[demo] Acquisition stopped, %d samples\n", sample_count);
+		printf("[daemon] Acquisition stopped, %d samples\n", sample_count);
 
 		/* Small delay before re-entering wait state */
 		usleep(100000);
@@ -510,6 +555,14 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 	iio_context_set_timeout(s.ctx, 0);	/* blocking, no timeout */
+
+	/* ---- Open dedicated sample log file (truncate on startup) ---- */
+	g_sample_log = fopen(BIA_SAMPLE_LOG_PATH, "w");
+	if (g_sample_log)
+		printf("[daemon] Sample log: %s\n", BIA_SAMPLE_LOG_PATH);
+	else
+		fprintf(stderr, "[daemon] WARNING: Cannot open %s: %s\n",
+			BIA_SAMPLE_LOG_PATH, strerror(errno));
 
 	/* ---- Find AD5940 device ---- */
 	s.dev = iio_context_find_device(s.ctx, "ad5940");
@@ -609,8 +662,8 @@ int main(int argc, char *argv[])
 	int rcvbuf = 4096;
 	setsockopt(cmd_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-	printf("[demo] Daemon ready. Listening on %s\n", BIA_CMD_SOCK_PATH);
-	printf("[demo] Commands: S=START T=STOP ?=STATUS Q=QUIT\n");
+	printf("[daemon] Daemon ready. Listening on %s\n", BIA_CMD_SOCK_PATH);
+	printf("[daemon] Commands: S=START T=STOP ?=STATUS Q=QUIT\n");
 
 	/* ---- Command loop ---- */
 	while (g_keep_running) {
@@ -705,7 +758,9 @@ cleanup:
 	/* s.buf and s.channels are owned by s.ctx */
 	if (s.ctx)
 		iio_context_destroy(s.ctx);
+	if (g_sample_log)
+		fclose(g_sample_log);
 
-	printf("[demo] Exited.\n");
+	printf("[daemon] Exited.\n");
 	return ret;
 }

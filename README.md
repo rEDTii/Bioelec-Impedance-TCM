@@ -293,6 +293,70 @@ sh scripts/AFE_disable.sh   # 关闭采集
 sh scripts/cpu_test.sh      # 检测内核态 CPU 占用
 ```
 
+### 4.6 预期测试现象
+
+系统正常采集时，可从两个窗口同时观察数据：
+
+#### (A) 屏幕 — Qt GUI Bode 图
+
+Qt 前端启动后点击 **"启动"** 按钮，屏幕上实时绘制阻抗幅频/相频响应曲线：
+
+<!-- TODO: 插入 Qt GUI 运行截图（Bode 图） -->
+<p align="center">
+  <img src="docs/bode_screenshot.png" alt="Bode 图截图" width="80%" />
+</p>
+<p align="center">图：实时 Bode 图 — 蓝线为 |Z|(Ω)，红线为 Phase(°)，X 轴为对数频率</p>
+
+- X 轴：对数频率坐标，覆盖扫频范围（如 2.2kHz ~ 100kHz）
+- 左 Y 轴：阻抗幅值 |Z|（Ω）
+- 右 Y 轴：相位角（°）
+- 状态栏显示采集进度：`采集中... N/M 个频点`
+- 一轮扫频完成后自动停止并更新状态标签
+
+#### (B) 串口终端 — 实时原始数据
+
+通过串口登录开发板，可实时查看每个频点的完整测量值。根据 daemon 运行方式不同：
+
+**前台运行**（手动启动，stdout 直连终端）：数据直接打印到串口。
+
+**后台运行**（开机自启 / `&` 后台）：stdout 被重定向至日志文件，需通过以下命令实时跟踪：
+
+```bash
+# 清空旧日志（可选，避免历史数据干扰）
+> /var/log/ad5940_samples.log
+
+# 实时跟踪采样数据
+tail -f /var/log/ad5940_samples.log
+```
+
+预期输出格式：
+
+```text
+===== Acquisition STARTED (expecting 12 points) =====
+
+[ 1/12]   2200 Hz  |Z|=  1234.56Ω  Ph=  +12.34° R=  1205.23Ω  X=    +265.10Ω
+               (I:+45230,-12890  V:+8923,+4567  Rtia=1000.5mΩ/0.3mdeg)
+[ 2/12]   5000 Hz  |Z|=   987.65Ω  Ph=   -5.67° R=   983.45Ω  X=    -97.32Ω
+               (I:+38120,-9230   V:+7654,+3210  Rtia=1000.8mΩ/0.2mdeg)
+ ...
+[12/12] 100000 Hz  |Z|=    45.67Ω  Ph=  +67.89° R=    17.10Ω  X=    +42.31Ω
+               (I:+520,-180     V:+15,+18       Rtia=1001.2mΩ/0.5mdeg)
+
+===== Sweep COMPLETE: 12/12 samples collected =====
+```
+
+各字段含义：
+
+| 字段 | 说明 |
+|------|------|
+| `|Z|` | 阻抗幅值 (Ohms) |
+| `Ph` | 阻抗相位角 (degrees) |
+| `R` | 电阻分量 = \|Z\| × cos(Ph) (Ohms) |
+| `X` | 电抗分量 = \|Z\| × sin(Ph) (Ohms) |
+| `I:±d,±d` | 电流通道 DFT 原始值（实部, 虚部，18-bit 符号扩展后） |
+| `V:±d,±d` | 电压通道 DFT 原始值（实部, 虚部） |
+| `Rtia` | 当前频段 RTIA 校准因子（幅值 mΩ / 相位 mdeg） |
+
 ## License
 
 SPDX-License-Identifier: GPL-2.0-only

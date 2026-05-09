@@ -122,7 +122,8 @@ start_daemon()
     fi
     log "[ad5940] Starting daemon..."
     start-stop-daemon -S -b -m -p "$DAEMON_PID" \
-        -x "$DAEMON_BIN"
+        -x "$DAEMON_BIN" \
+        -- >"$LOG" 2>&1
 }
 
 # ---------------------------------------------------------------
@@ -163,7 +164,8 @@ start_qt()
         fi
 
         start-stop-daemon -S -b -m -p "$QT_PID" \
-            -x "$QT_BIN"
+            -x "$QT_BIN" \
+            -- >>"$LOG" 2>&1
     ) &
 }
 

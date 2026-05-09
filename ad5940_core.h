@@ -727,7 +727,6 @@ enum ad5940_sweep_type {
  * sweep_points is auto-set to the array size.
  */
 #define AD5940_BIA_CUSTOM_FREQ_TABLE {			\
-	1,		/*   1 Hz  */			\
 	10,		/*  10 Hz  */			\
 	25,		/*  25 Hz  */			\
 	50,		/*  50 Hz  */			\

@@ -1370,7 +1370,7 @@ int ad5940_bia_sweep_step(struct ad5940_priv *priv)
 		u32 meas_buf[128];
 		int meas_len;
 
-		dev_info(dev, "Band change at %uHz: S2OSR %u→%u, DFTSRC %u→%u, HP %u→%u\n",
+		dev_dbg(dev, "Band change at %uHz: S2OSR %u→%u, DFTSRC %u→%u, HP %u→%u\n",
 			 priv->sweep_curr_freq_hz,
 			 priv->curr_freq_params.sinc2osr, next_params.sinc2osr,
 			 priv->curr_freq_params.dft_src, next_params.dft_src,
@@ -1405,7 +1405,7 @@ int ad5940_bia_sweep_step(struct ad5940_priv *priv)
 
 			priv->meas_seq_len = meas_len;
 
-			dev_info(dev, "Regenerated meas seq: %d cmds at SRAM[%u]\n",
+			dev_dbg(dev, "Regenerated meas seq: %d cmds at SRAM[%u]\n",
 				 meas_len, priv->meas_seq_addr);
 		}
 
@@ -2935,7 +2935,7 @@ int ad5940_bia_start(struct ad5940_priv *priv)
 	// 		 wupt_seqorder, wuptcon, tmrcon, sleep_time);
 	// }
 
-	dev_info(dev, "BIA: measurement started (ODR=%dHz, ADI flow replicated)\n",
+	dev_dbg(dev, "BIA: measurement started (ODR=%dHz, ADI flow replicated)\n",
 		 AD5940_BIA_ODR);
 	return 0;
 }
@@ -3014,7 +3014,7 @@ int ad5940_bia_stop(struct ad5940_priv *priv)
 		priv->irq_disabled = false;
 	}
 
-	dev_info(dev, "BIA: measurement stopped\n");
+	dev_dbg(dev, "BIA: measurement stopped\n");
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ad5940_bia_stop);
