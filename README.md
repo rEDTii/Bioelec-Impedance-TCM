@@ -8,6 +8,8 @@
 
 ### 1.1 概述
 
+<img width="600" alt="b60868f44850190c2fdfd4b50db2e61b" src="https://github.com/user-attachments/assets/e105a707-1ae3-43d6-a2ac-6f048057cc74" />
+
 本项目实现了一套完整的 **Linux 嵌入式生物阻抗（BIA）采集系统**，覆盖从内核驱动到用户态可视化应用的全栈开发。系统以 ADI AD5940 高精度模拟前端（AFE）为核心，通过 SPI 接口与 RK3568 通信，利用 AFE 内部序列器（Sequencer）自动完成激励信号发生、ADC 采样、DFT 运算等测量流程，FIFO 阈值中断触发内核 IIO triggered buffer 机制，将 4 通道 DFT 原始数据推送至用户态。用户态守护进程通过 libiio 流式读取 IIO buffer，完成 18-bit 符号扩展与阻抗计算后，经 Unix DGRAM Socket 将结果推送至 Qt GUI 前端实时绘制 Bode 图。
 
 ### 1.2 系统架构
@@ -301,11 +303,8 @@ sh scripts/cpu_test.sh      # 检测内核态 CPU 占用
 
 Qt 前端启动后点击 **"启动"** 按钮，屏幕上实时绘制阻抗幅频/相频响应曲线：
 
-<!-- TODO: 插入 Qt GUI 运行截图（Bode 图） -->
-<p align="center">
-  <img src="docs/bode_screenshot.png" alt="Bode 图截图" width="80%" />
-</p>
-<p align="center">图：实时 Bode 图 — 蓝线为 |Z|(Ω)，红线为 Phase(°)，X 轴为对数频率</p>
+<img width="600" alt="image" src="https://github.com/user-attachments/assets/77cea791-8f4a-4722-8de1-5e764667cca0" />
+
 
 - X 轴：对数频率坐标，覆盖扫频范围（如 2.2kHz ~ 100kHz）
 - 左 Y 轴：阻抗幅值 |Z|（Ω）
