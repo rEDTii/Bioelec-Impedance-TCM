@@ -8,7 +8,8 @@
 
 ### 1.1 概述
 
-<img width="600" alt="b60868f44850190c2fdfd4b50db2e61b" src="https://github.com/user-attachments/assets/e105a707-1ae3-43d6-a2ac-6f048057cc74" />
+<img width="600" alt="4d7c0b656f1702f0ac54ac1991806ff8" src="https://github.com/user-attachments/assets/be046e03-ddfe-49d0-9a57-df5cbf5db86d" />
+
 
 本项目实现了一套完整的 **Linux 嵌入式生物阻抗（BIA）采集系统**，覆盖从内核驱动到用户态可视化应用的全栈开发。系统以 ADI AD5940 高精度模拟前端（AFE）为核心，通过 **开尔文四线法（Kelvin 4-wire）** 测量连接至人体皮肤，采用四电极配置（CE1/CE2 激励电极 + SE1/SE2 采样电极）消除引线电阻误差，在 50μA~750μA 可编程激励电流下完成人体生物阻抗宽频高精度测量。通过 SPI 接口与 RK3568 通信，利用 AFE 内部序列器（Sequencer）自动完成激励信号发生、ADC 采样、DFT 运算等测量流程，FIFO 阈值中断触发内核 IIO triggered buffer 机制，将 4 通道 DFT 原始数据推送至用户态。用户态守护进程通过 libiio 流式读取 IIO buffer，完成 18-bit 符号扩展与阻抗计算后，经 Unix DGRAM Socket 将结果推送至 Qt GUI 前端实时绘制 Bode 图。
 
